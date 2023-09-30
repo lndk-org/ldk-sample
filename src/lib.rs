@@ -380,6 +380,16 @@ async fn handle_ldk_events(
 			}
 			fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound.encode()).unwrap();
 		}
+		Event::InvoiceRequestFailed { payment_id } => {
+			print!(
+				"\nEVENT: Failed to request invoice to send payment with id {}",
+				payment_id,
+			);
+			print!("> ");
+			io::stdout().flush().unwrap();
+
+			// TODO: mark the payment as failed
+		}
 		Event::PaymentForwarded {
 			prev_channel_id,
 			next_channel_id,

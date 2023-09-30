@@ -5,7 +5,7 @@ use crate::{
 };
 
 use bitcoin::secp256k1::PublicKey;
-use lightning::onion_message::{Destination, OnionMessageContents, OnionMessagePath};
+use lightning::onion_message::{Destination, OnionMessagePath};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
 use lightning::sign::KeysManager;
@@ -125,7 +125,7 @@ impl Node {
 		let message_path = OnionMessagePath { intermediate_nodes, destination };
 		match self.onion_messenger.send_onion_message(
 			message_path,
-			OnionMessageContents::Custom(UserOnionMessageContents { tlv_type, data }),
+			UserOnionMessageContents { tlv_type, data }, // <dyn OnionMessageContents>::Custom()
 			None,
 		) {
 			Ok(()) => {

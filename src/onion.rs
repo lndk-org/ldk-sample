@@ -1,6 +1,6 @@
 use lightning::io::Read;
 use lightning::ln::msgs::DecodeError;
-use lightning::onion_message::{CustomOnionMessageContents, CustomOnionMessageHandler};
+use lightning::onion_message::{OnionMessageContents, CustomOnionMessageHandler, PendingOnionMessage};
 use lightning::util::ser::{Writeable, Writer};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ pub struct UserOnionMessageContents {
 	pub data: Vec<u8>,
 }
 
-impl CustomOnionMessageContents for UserOnionMessageContents {
+impl OnionMessageContents for UserOnionMessageContents {
 	fn tlv_type(&self) -> u64 {
 		self.tlv_type
 	}
@@ -45,4 +45,9 @@ impl CustomOnionMessageHandler for OnionMessageHandler {
 		let _ = buffer.read_to_end(&mut buf);
 		Ok(Some(UserOnionMessageContents { tlv_type: message_type, data: buf.to_vec() }))
 	}
+
+        // We don't need this for our purposes yet.
+        fn release_pending_custom_messages(&self) -> Vec<PendingOnionMessage<Self::CustomMessage>> {
+		unimplemented!();
+        }
 }
