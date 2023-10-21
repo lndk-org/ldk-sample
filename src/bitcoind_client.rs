@@ -296,13 +296,6 @@ impl BroadcasterInterface for BitcoindClient {
 	}
 }
 
-impl UtxoLookup for BitcoindClient {
-	fn get_utxo(&self, _genesis_hash: &BlockHash, _short_channel_id: u64) -> UtxoResult {
-		// P2PGossipSync takes None for a UtxoLookup, so this will never be called.
-		todo!();
-	}
-}
-
 impl WalletSource for BitcoindClient {
 	fn list_confirmed_utxos(&self) -> Result<Vec<Utxo>, ()> {
 		let utxos = tokio::task::block_in_place(move || {
