@@ -548,6 +548,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		args.bitcoind_rpc_port,
 		args.bitcoind_rpc_username.clone(),
 		args.bitcoind_rpc_password.clone(),
+		args.network,
 		tokio::runtime::Handle::current(),
 		Arc::clone(&logger),
 	)
