@@ -1,4 +1,4 @@
-use bitcoin::hashes::hex::FromHex;
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, BlockHash, Txid};
 use lightning_block_sync::http::JsonResponse;
 use std::convert::TryInto;
@@ -111,7 +111,7 @@ impl TryInto<BlockchainInfo> for JsonResponse {
 	fn try_into(self) -> std::io::Result<BlockchainInfo> {
 		Ok(BlockchainInfo {
 			latest_height: self.0["blocks"].as_u64().unwrap() as usize,
-			latest_blockhash: BlockHash::from_hex(self.0["bestblockhash"].as_str().unwrap())
+			latest_blockhash: BlockHash::from_str(self.0["bestblockhash"].as_str().unwrap())
 				.unwrap(),
 			chain: self.0["chain"].as_str().unwrap().to_string(),
 		})
@@ -122,7 +122,7 @@ pub struct ListUnspentUtxo {
 	pub txid: Txid,
 	pub vout: u32,
 	pub amount: u64,
-	pub address: Address,
+	pub address: Address<NetworkUnchecked>,
 }
 
 pub struct ListUnspentResponse(pub Vec<ListUnspentUtxo>);

@@ -11,7 +11,7 @@ use lightning::blinded_path::BlindedPath;
 use lightning::ln::ChannelId;
 use lightning::offers::offer::{Offer, OfferBuilder, Quantity};
 use lightning::offers::parse::Bolt12SemanticError;
-use lightning::onion_message::{Destination, OnionMessagePath};
+use lightning::onion_message::messenger::{Destination, OnionMessagePath};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
 use lightning::sign::KeysManager;
@@ -157,14 +157,15 @@ impl Node {
 			return Err(());
 		}
 		let destination = Destination::Node(intermediate_nodes.pop().unwrap());
-		let message_path = OnionMessagePath { intermediate_nodes, destination };
-		match self.onion_messenger.send_onion_message(
+		let message_path =
+			OnionMessagePath { intermediate_nodes, destination, first_node_addresses: None };
+		match self.onion_messenger.send_onion_message_using_path(
 			message_path,
 			UserOnionMessageContents { tlv_type, data },
 			None,
 		) {
-			Ok(()) => {
-				println!("SUCCESS: forwarded onion message to first hop");
+			Ok(success) => {
+				println!("SUCCESS: forwarded onion message to first hop {:?}", success);
 				Ok(())
 			}
 			Err(e) => {
@@ -223,5 +224,5 @@ fn open_channel(
 		..Default::default()
 	};
 
-	channel_manager.create_channel(peer_pubkey, channel_amt_sat, push_msat, 0, Some(config))
+	channel_manager.create_channel(peer_pubkey, channel_amt_sat, push_msat, 0, None, Some(config))
 }

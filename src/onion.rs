@@ -8,11 +8,9 @@ use lightning::blinded_path::payment::{PaymentConstraints, ReceiveTlvs};
 use lightning::blinded_path::BlindedPath;
 use lightning::io::Read;
 use lightning::ln::msgs::DecodeError;
-use lightning::ln::{PaymentHash, PaymentPreimage};
-use lightning::onion_message::{
-	CustomOnionMessageHandler, OffersMessage, OffersMessageHandler, OnionMessageContents,
-	PendingOnionMessage,
-};
+use lightning::onion_message::messenger::{CustomOnionMessageHandler, PendingOnionMessage};
+use lightning::onion_message::offers::{OffersMessage, OffersMessageHandler};
+use lightning::onion_message::packet::OnionMessageContents;
 use lightning::sign::KeysManager;
 use lightning::util::logger::Logger;
 use lightning::util::ser::{Writeable, Writer};

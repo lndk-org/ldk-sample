@@ -31,7 +31,7 @@ use lightning::ln::msgs::DecodeError;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
 use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::log_info;
-use lightning::onion_message::{DefaultMessageRouter, OnionMessenger};
+use lightning::onion_message::messenger::{DefaultMessageRouter, OnionMessenger};
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::router::DefaultRouter;
@@ -152,11 +152,6 @@ pub(crate) type GossipVerifier = lightning_block_sync::gossip::GossipVerifier<
 	lightning_block_sync::gossip::TokioSpawner,
 	Arc<lightning_block_sync::rpc::RpcClient>,
 	Arc<FilesystemLogger>,
-	SocketDescriptor,
-	Arc<ChannelManager>,
-	Arc<OnionMessengerType>,
-	IgnoringMessageHandler,
-	Arc<KeysManager>,
 >;
 
 pub(crate) type P2PGossipSyncType = lightning::routing::gossip::P2PGossipSync<
@@ -187,7 +182,7 @@ pub(crate) type OnionMessengerType = OnionMessenger<
 	Arc<KeysManager>,
 	Arc<KeysManager>,
 	Arc<FilesystemLogger>,
-	Arc<DefaultMessageRouter>,
+	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>>>,
 	Arc<OnionMessageHandler>,
 	Arc<OnionMessageHandler>,
 >;
@@ -218,12 +213,12 @@ async fn handle_ldk_events(
 			// Construct the raw transaction with one output, that is paid the amount of the
 			// channel.
 			let addr = WitnessProgram::from_scriptpubkey(
-				&output_script[..],
+				&output_script.as_bytes(),
 				match network {
 					Network::Bitcoin => bitcoin_bech32::constants::Network::Bitcoin,
-					Network::Testnet => bitcoin_bech32::constants::Network::Testnet,
 					Network::Regtest => bitcoin_bech32::constants::Network::Regtest,
 					Network::Signet => bitcoin_bech32::constants::Network::Signet,
+					Network::Testnet | _ => bitcoin_bech32::constants::Network::Testnet,
 				},
 			)
 			.expect("Lightning funding tx should always be to a SegWit output")
@@ -271,12 +266,11 @@ async fn handle_ldk_events(
 				"\nEVENT: received payment from payment hash {} of {} millisatoshis",
 				payment_hash, amount_msat,
 			);
-			print!("> ");
-			io::stdout().flush().unwrap();
 			let payment_preimage = match purpose {
 				PaymentPurpose::InvoicePayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
 			};
+
 			channel_manager.claim_funds(payment_preimage.unwrap());
 		}
 		Event::PaymentClaimed {
@@ -517,6 +511,7 @@ async fn handle_ldk_events(
 			user_channel_id: _,
 			counterparty_node_id,
 			channel_capacity_sats: _,
+			channel_funding_txo: _,
 		} => {
 			println!(
 				"\nEVENT: Channel {} with counterparty {} closed due to: {:?}",
@@ -531,6 +526,7 @@ async fn handle_ldk_events(
 		}
 		Event::HTLCIntercepted { .. } => {}
 		Event::BumpTransaction(event) => bump_tx_event_handler.handle_event(&event),
+		Event::ConnectionNeeded { .. } => {}
 	}
 }
 
@@ -568,9 +564,9 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	if bitcoind_chain
 		!= match args.network {
 			bitcoin::Network::Bitcoin => "main",
-			bitcoin::Network::Testnet => "test",
 			bitcoin::Network::Regtest => "regtest",
 			bitcoin::Network::Signet => "signet",
+			bitcoin::Network::Testnet | _ => "test",
 		} {
 		panic!(
 			"Chain argument ({}) didn't match bitcoind chain ({})",
@@ -685,6 +681,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
 	user_config.manually_accept_inbound_channels = true;
+	user_config.accept_forwards_to_priv_channels = true;
 	let mut restarting_node = true;
 	let (channel_manager_blockhash, channel_manager) = {
 		if let Ok(mut f) = fs::File::open(format!("{}/manager", ldk_data_dir.clone())) {
@@ -794,7 +791,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
-		Arc::new(DefaultMessageRouter {}),
+		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph))),
 		Arc::clone(&onion_message_handler),
 		Arc::clone(&onion_message_handler),
 	));
@@ -956,6 +953,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 			})
 		},
 		false,
+		|| Some(Duration::ZERO),
 	));
 
 	// Regularly reconnect to channel peers.
