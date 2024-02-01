@@ -1,4 +1,3 @@
-use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, BlockHash, Txid};
 use lightning_block_sync::http::JsonResponse;
 use std::convert::TryInto;
@@ -122,7 +121,7 @@ pub struct ListUnspentUtxo {
 	pub txid: Txid,
 	pub vout: u32,
 	pub amount: u64,
-	pub address: Address<NetworkUnchecked>,
+	pub address: Address,
 }
 
 pub struct ListUnspentResponse(pub Vec<ListUnspentUtxo>);
@@ -141,7 +140,9 @@ impl TryInto<ListUnspentResponse> for JsonResponse {
 				amount: bitcoin::Amount::from_btc(utxo["amount"].as_f64().unwrap())
 					.unwrap()
 					.to_sat(),
-				address: Address::from_str(&utxo["address"].as_str().unwrap().to_string()).unwrap(),
+				address: Address::from_str(&utxo["address"].as_str().unwrap().to_string())
+					.unwrap()
+					.assume_checked(), // the expected network is not known at this point
 			})
 			.collect();
 		Ok(ListUnspentResponse(utxos))

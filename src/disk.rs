@@ -33,6 +33,7 @@ impl Logger for FilesystemLogger {
 		if record.level < self.level {
 			return;
 		}
+
 		let raw_log = record.args.to_string();
 		let log = format!(
 			"{} {:<5} [{}:{}] {}\n",

@@ -11,8 +11,8 @@ use bitcoin::secp256k1::PublicKey;
 use lightning::ln::channelmanager::{PaymentId, RecipientOnionFields, Retry};
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage};
-use lightning::onion_message::OnionMessagePath;
-use lightning::onion_message::{Destination, OnionMessageContents};
+use lightning::onion_message::messenger::Destination;
+use lightning::onion_message::packet::OnionMessageContents;
 use lightning::routing::gossip::NodeId;
 use lightning::routing::router::{PaymentParameters, RouteParameters};
 use lightning::sign::{EntropySource, KeysManager};
@@ -442,13 +442,14 @@ pub(crate) fn poll_for_user_input(
 						}
 					};
 					let destination = Destination::Node(intermediate_nodes.pop().unwrap());
-					let message_path = OnionMessagePath { intermediate_nodes, destination };
 					match onion_messenger.send_onion_message(
-						message_path,
 						UserOnionMessageContents { tlv_type, data },
+						destination,
 						None,
 					) {
-						Ok(()) => println!("SUCCESS: forwarded onion message to first hop"),
+						Ok(success) => {
+							println!("SUCCESS: forwarded onion message to first hop {:?}", success)
+						}
 						Err(e) => println!("ERROR: failed to send onion message: {:?}", e),
 					}
 				}
@@ -704,16 +705,47 @@ fn send_payment(
 
 	let mut recipient_onion = RecipientOnionFields::secret_only(*invoice.payment_secret());
 	recipient_onion.payment_metadata = invoice.payment_metadata().map(|v| v.clone());
-	let mut payment_params = PaymentParameters::from_node_id(invoice.recover_payee_pub_key(),
-		invoice.min_final_cltv_expiry_delta() as u32)
-		.with_expiry_time(invoice.duration_since_epoch().as_secs() + invoice.expiry_time().as_secs())
-		.with_route_hints(invoice.route_hints()).unwrap();
+	let mut payment_params = match PaymentParameters::from_node_id(
+		invoice.recover_payee_pub_key(),
+		invoice.min_final_cltv_expiry_delta() as u32,
+	)
+	.with_expiry_time(
+		invoice.duration_since_epoch().as_secs().saturating_add(invoice.expiry_time().as_secs()),
+	)
+	.with_route_hints(invoice.route_hints())
+	{
+		Err(e) => {
+			println!("ERROR: Could not process invoice to prepare payment parameters, {:?}, invoice: {:?}", e, invoice);
+			return;
+		}
+		Ok(p) => p,
+	};
 	if let Some(features) = invoice.features() {
-		payment_params = payment_params.with_bolt11_features(features.clone()).unwrap();
+		payment_params = match payment_params.with_bolt11_features(features.clone()) {
+			Err(e) => {
+				println!("ERROR: Could not build BOLT11 payment parameters! {:?}", e);
+				return;
+			}
+			Ok(p) => p,
+		};
 	}
-	let route_params = RouteParameters::from_payment_params_and_value(payment_params, invoice.amount_milli_satoshis().unwrap_or_default());
+	let invoice_amount = match invoice.amount_milli_satoshis() {
+		None => {
+			println!("ERROR: An invoice with an amount is expected; {:?}", invoice);
+			return;
+		}
+		Some(a) => a,
+	};
+	let route_params =
+		RouteParameters::from_payment_params_and_value(payment_params, invoice_amount);
 
-	match channel_manager.send_payment(payment_hash, recipient_onion, payment_id, route_params, Retry::Timeout(Duration::from_secs(10))) {
+	match channel_manager.send_payment(
+		payment_hash,
+		recipient_onion,
+		payment_id,
+		route_params,
+		Retry::Timeout(Duration::from_secs(10)),
+	) {
 		Ok(_) => {
 			let payee_pubkey = invoice.recover_payee_pub_key();
 			let amt_msat = invoice.amount_milli_satoshis().unwrap();

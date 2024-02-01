@@ -11,7 +11,7 @@ use lightning::blinded_path::BlindedPath;
 use lightning::ln::ChannelId;
 use lightning::offers::offer::{Offer, OfferBuilder, Quantity};
 use lightning::offers::parse::Bolt12SemanticError;
-use lightning::onion_message::messenger::{Destination, OnionMessagePath};
+use lightning::onion_message::messenger::Destination;
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
 use lightning::sign::KeysManager;
@@ -157,11 +157,9 @@ impl Node {
 			return Err(());
 		}
 		let destination = Destination::Node(intermediate_nodes.pop().unwrap());
-		let message_path =
-			OnionMessagePath { intermediate_nodes, destination, first_node_addresses: None };
-		match self.onion_messenger.send_onion_message_using_path(
-			message_path,
+		match self.onion_messenger.send_onion_message(
 			UserOnionMessageContents { tlv_type, data },
+			destination,
 			None,
 		) {
 			Ok(success) => {
