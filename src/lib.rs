@@ -1002,11 +1002,8 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	let peer_man = Arc::clone(&peer_manager);
 	let chan_man = Arc::clone(&channel_manager);
 	tokio::spawn(async move {
-		// First wait a minute until we have some peers and maybe have opened a channel.
-		tokio::time::sleep(Duration::from_secs(60)).await;
-		// Then, update our announcement once an hour to keep it fresh but avoid unnecessary churn
-		// in the global gossip network.
-		let mut interval = tokio::time::interval(Duration::from_secs(3600));
+		// Announce our node at a frequent interval for lndk's integration tests.
+		let mut interval = tokio::time::interval(Duration::from_secs(20));
 		loop {
 			interval.tick().await;
 			// Don't bother trying to announce if we don't have any public channls, though our
