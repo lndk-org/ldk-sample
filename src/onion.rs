@@ -143,11 +143,11 @@ impl OffersMessageHandler for OnionMessageHandler {
 						})
 						.expect("failed verifying signature"),
 				));
-			}
+			},
 			_ => {
 				log_error!(self.logger, "Unsupported offers message type");
 				return None;
-			}
+			},
 		};
 	}
 

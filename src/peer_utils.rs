@@ -20,7 +20,7 @@ pub(crate) async fn do_connect_peer(
 					return Ok(());
 				}
 			}
-		}
+		},
 		None => Err(()),
 	}
 }

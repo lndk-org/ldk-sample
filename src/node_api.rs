@@ -92,7 +92,7 @@ impl Node {
 				let peer_data_path = format!("{:?}/channel_peer_data", self.ldk_data_dir);
 				let _ = persist_channel_peer(Path::new(&peer_data_path), &peer_pubkey_and_ip_addr);
 				Ok(channel_id)
-			}
+			},
 			Err(e) => Err(e),
 		}
 	}
@@ -117,11 +117,11 @@ impl Node {
 			Ok(success) => {
 				println!("SUCCESS: forwarded onion message to first hop {:?}", success);
 				Ok(())
-			}
+			},
 			Err(e) => {
 				println!("ERROR: failed to send onion message: {:?}", e);
 				Ok(())
-			}
+			},
 		}
 	}
 
@@ -211,4 +211,40 @@ fn open_channel(
 	};
 
 	channel_manager.create_channel(peer_pubkey, channel_amt_sat, push_msat, 0, None, Some(config))
+}
+
+pub(crate) async fn connect_peer_if_necessary(
+	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManagerType>,
+) -> Result<(), ()> {
+	for (node_pubkey, _) in peer_manager.get_peer_node_ids() {
+		if node_pubkey == pubkey {
+			return Ok(());
+		}
+	}
+	let res = do_connect_peer(pubkey, peer_addr, peer_manager).await;
+	if res.is_err() {
+		println!("ERROR: failed to connect to peer");
+	}
+	res
+}
+
+pub(crate) async fn do_connect_peer(
+	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManagerType>,
+) -> Result<(), ()> {
+	match lightning_net_tokio::connect_outbound(Arc::clone(&peer_manager), pubkey, peer_addr).await
+	{
+		Some(connection_closed_future) => {
+			let mut connection_closed_future = Box::pin(connection_closed_future);
+			loop {
+				tokio::select! {
+					_ = &mut connection_closed_future => return Err(()),
+					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
+				};
+				if peer_manager.get_peer_node_ids().iter().find(|(id, _)| *id == pubkey).is_some() {
+					return Ok(());
+				}
+			}
+		},
+		None => Err(()),
+	}
 }
