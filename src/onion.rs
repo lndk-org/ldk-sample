@@ -1,18 +1,17 @@
 use crate::disk::FilesystemLogger;
 use crate::ChannelManager;
-use bitcoin::hashes::sha256::Hash as Sha256;
-use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{KeyPair, PublicKey, Secp256k1};
 use core::convert::Infallible;
-use lightning::blinded_path::payment::{PaymentConstraints, ReceiveTlvs};
+use lightning::blinded_path::payment::{
+	ForwardNode, ForwardTlvs, PaymentConstraints, PaymentRelay, ReceiveTlvs,
+};
 use lightning::blinded_path::BlindedPath;
 use lightning::io::Read;
+use lightning::ln::features::BlindedHopFeatures;
 use lightning::ln::msgs::DecodeError;
-use lightning::ln::{PaymentHash, PaymentPreimage};
-use lightning::onion_message::{
-	CustomOnionMessageHandler, OffersMessage, OffersMessageHandler, OnionMessageContents,
-	PendingOnionMessage,
-};
+use lightning::onion_message::messenger::{CustomOnionMessageHandler, PendingOnionMessage};
+use lightning::onion_message::offers::{OffersMessage, OffersMessageHandler};
+use lightning::onion_message::packet::OnionMessageContents;
 use lightning::sign::KeysManager;
 use lightning::util::logger::Logger;
 use lightning::util::ser::{Writeable, Writer};
@@ -75,15 +74,8 @@ impl OffersMessageHandler for OnionMessageHandler {
 		log_info!(self.logger, "Received a new offers message!");
 		match message {
 			OffersMessage::InvoiceRequest(ref invoice_request) => {
-				// Create a test preimage/secret for the payment. Since these are just for our tests
-				// the values here don't really matter that much.
-				let payment_preimage = PaymentPreimage([0; 32]);
-				let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0[..]).into_inner());
-				// TODO: Not sure if we'll need to set these None values when the payment is actually made.
-				let payment_secret = self
-					.channel_manager
-					.create_inbound_payment_for_hash(payment_hash, None, 7200, None)
-					.unwrap();
+				let (payment_hash, payment_secret) =
+					self.channel_manager.create_inbound_payment(None, 3600, None).unwrap();
 
 				// Reminder that to keep things simple for our tests, we assume we're only connected to zero or one channel
 				// for now.
@@ -99,10 +91,34 @@ impl OffersMessageHandler for OnionMessageHandler {
 					},
 				};
 
+				let forwarding_tlv = ForwardTlvs {
+					short_channel_id: chans[0].short_channel_id.unwrap(),
+					payment_relay: PaymentRelay {
+						cltv_expiry_delta: chans[0].config.unwrap().cltv_expiry_delta,
+						fee_proportional_millionths: chans[0]
+							.config
+							.unwrap()
+							.forwarding_fee_proportional_millionths,
+						fee_base_msat: chans[0].config.unwrap().forwarding_fee_base_msat,
+					},
+					payment_constraints: PaymentConstraints {
+						max_cltv_expiry: 1000000,
+						htlc_minimum_msat: 1,
+					},
+					features: BlindedHopFeatures::empty(),
+				};
+				let intermediate_nodes = &[ForwardNode {
+					tlvs: forwarding_tlv,
+					node_id: chans[0].counterparty.node_id,
+					htlc_maximum_msat: chans[0].inbound_htlc_maximum_msat.unwrap(),
+				}];
+
 				let secp_ctx = Secp256k1::new();
-				let blinded_path = BlindedPath::one_hop_for_payment(
+				let blinded_path = BlindedPath::new_for_payment(
+					intermediate_nodes,
 					self.node_id,
 					payee_tlvs,
+					chans[0].inbound_htlc_maximum_msat.unwrap(),
 					&*self.keys_manager,
 					&secp_ctx,
 				)
@@ -111,15 +127,13 @@ impl OffersMessageHandler for OnionMessageHandler {
 				let secret_key = self.keys_manager.get_node_secret_key();
 				let keys = KeyPair::from_secret_key(&secp_ctx, &secret_key);
 				let pubkey = PublicKey::from(keys);
-				let wpubkey_hash =
-					bitcoin::util::key::PublicKey::new(pubkey).wpubkey_hash().unwrap();
+				let wpubkey_hash = bitcoin::PublicKey::new(pubkey).wpubkey_hash().unwrap();
 
 				return Some(OffersMessage::Invoice(
 					invoice_request
 						.respond_with(vec![blinded_path], payment_hash)
 						.unwrap()
 						.relative_expiry(3600)
-						//.allow_mpp()
 						.fallback_v0_p2wpkh(&wpubkey_hash)
 						.build()
 						.unwrap()
