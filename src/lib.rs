@@ -177,13 +177,16 @@ pub(crate) type ChannelManager =
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
 
 // Reminder: We define the OnionMessenger as such because we need to use the OnionMessageHandler.
-// This deviates from the main ldk-sample fork.
-// This also impacts the PeerManager and GossipVerifier type definitions above.
+// This deviates from the main ldk-sample fork. This also impacts the PeerManager and
+// GossipVerifier type definitions above.
+// TODO: We should sync this with ldk-sample. Now ChannelManager implements the OnionMessageHandler
+// and we no longer need to do this.
 pub(crate) type OnionMessengerType = OnionMessenger<
 	Arc<KeysManager>,
 	Arc<KeysManager>,
 	Arc<FilesystemLogger>,
-	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>>>,
+	Arc<ChannelManager>,
+	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<KeysManager>>>,
 	Arc<OnionMessageHandler>,
 	Arc<OnionMessageHandler>,
 >;
@@ -268,7 +271,9 @@ async fn handle_ldk_events(
 				payment_hash, amount_msat,
 			);
 			let payment_preimage = match purpose {
-				PaymentPurpose::InvoicePayment { payment_preimage, .. } => payment_preimage,
+				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => payment_preimage,
+				PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => payment_preimage,
+				PaymentPurpose::Bolt12RefundPayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
 			};
 
@@ -289,9 +294,15 @@ async fn handle_ldk_events(
 			print!("> ");
 			io::stdout().flush().unwrap();
 			let (payment_preimage, payment_secret) = match purpose {
-				PaymentPurpose::InvoicePayment { payment_preimage, payment_secret, .. } => {
+				PaymentPurpose::Bolt11InvoicePayment {
+					payment_preimage, payment_secret, ..
+				} => (payment_preimage, Some(payment_secret)),
+				PaymentPurpose::Bolt12OfferPayment { payment_preimage, payment_secret, .. } => {
 					(payment_preimage, Some(payment_secret))
 				},
+				PaymentPurpose::Bolt12RefundPayment {
+					payment_preimage, payment_secret, ..
+				} => (payment_preimage, Some(payment_secret)),
 				PaymentPurpose::SpontaneousPayment(preimage) => (Some(preimage), None),
 			};
 			let mut inbound = inbound_payments.lock().unwrap();
@@ -401,9 +412,12 @@ async fn handle_ldk_events(
 		Event::PaymentForwarded {
 			prev_channel_id,
 			next_channel_id,
-			fee_earned_msat,
+			total_fee_earned_msat,
 			claim_from_onchain_tx,
 			outbound_amount_forwarded_msat,
+			skimmed_fee_msat: _,
+			prev_user_channel_id: _,
+			next_user_channel_id: _,
 		} => {
 			let read_only_network_graph = network_graph.read_only();
 			let nodes = read_only_network_graph.nodes();
@@ -446,7 +460,7 @@ async fn handle_ldk_events(
 			} else {
 				"?".to_string()
 			};
-			if let Some(fee_earned) = fee_earned_msat {
+			if let Some(fee_earned) = total_fee_earned_msat {
 				println!(
 					"\nEVENT: Forwarded payment for {} msat{}{}, earning {} msat {}",
 					amt_args, from_prev_str, to_next_str, fee_earned, from_onchain_str
@@ -687,7 +701,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	let router = Arc::new(DefaultRouter::new(
 		network_graph.clone(),
 		logger.clone(),
-		keys_manager.get_secure_random_bytes(),
+		keys_manager.clone(),
 		scorer.clone(),
 		scoring_fee_params,
 	));
@@ -723,7 +737,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 			restarting_node = false;
 
 			let polled_best_block = polled_chain_tip.to_best_block();
-			let polled_best_block_hash = polled_best_block.block_hash();
+			let polled_best_block_hash = polled_best_block.block_hash;
 			let chain_params =
 				ChainParameters { network: args.network, best_block: polled_best_block };
 			let fresh_channel_manager = channelmanager::ChannelManager::new(
@@ -807,7 +821,8 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
-		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph))),
+		Arc::clone(&channel_manager),
+		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager))),
 		Arc::clone(&onion_message_handler),
 		Arc::clone(&onion_message_handler),
 	));
@@ -987,12 +1002,11 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 			interval.tick().await;
 			match disk::read_channel_peer_data(Path::new(&peer_data_path)) {
 				Ok(info) => {
-					let peers = &connect_pm.get_peer_node_ids();
 					for node_id in connect_cm
 						.list_channels()
 						.iter()
 						.map(|chan| chan.counterparty.node_id)
-						.filter(|id| !peers.iter().any(|(pk, _)| id == pk))
+						.filter(|id| connect_pm.peer_by_node_id(id).is_none())
 					{
 						if stop_connect.load(Ordering::Acquire) {
 							return;

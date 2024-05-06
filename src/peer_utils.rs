@@ -13,10 +13,10 @@ pub(crate) async fn do_connect_peer(
 			let mut connection_closed_future = Box::pin(connection_closed_future);
 			loop {
 				tokio::select! {
-						_ = &mut connection_closed_future => return Err(()),
-						_ = tokio::time::sleep(Duration::from_millis(10)) => {},
+					_ = &mut connection_closed_future => return Err(()),
+					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
 				};
-				if peer_manager.get_peer_node_ids().iter().find(|(id, _)| *id == pubkey).is_some() {
+				if peer_manager.peer_by_node_id(&pubkey).is_some() {
 					return Ok(());
 				}
 			}

@@ -29,6 +29,7 @@ use tokio::sync::watch::Sender;
 pub(crate) type Router = DefaultRouter<
 	Arc<NetworkGraph>,
 	Arc<FilesystemLogger>,
+	Arc<KeysManager>,
 	Arc<RwLock<Scorer>>,
 	ProbabilisticScoringFeeParameters,
 	Scorer,
@@ -136,7 +137,8 @@ impl Node {
 			BlindedPath::new_for_message(path_pubkeys, &*self.keys_manager, &secp_ctx).unwrap();
 		let (pubkey, _) = self.get_node_info();
 
-		OfferBuilder::new("testing offer".to_string(), pubkey)
+		OfferBuilder::new(pubkey)
+			.description("testing offer".to_string())
 			.amount_msats(msats)
 			.chain(network)
 			.supported_quantity(quantity)
@@ -163,8 +165,8 @@ impl Node {
 pub(crate) async fn connect_peer_if_necessary(
 	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManagerType>,
 ) -> Result<(), ()> {
-	for (node_pubkey, _) in peer_manager.get_peer_node_ids() {
-		if node_pubkey == pubkey {
+	for peer_details in peer_manager.list_peers() {
+		if peer_details.counterparty_node_id == pubkey {
 			return Ok(());
 		}
 	}
@@ -187,7 +189,7 @@ pub(crate) async fn do_connect_peer(
 					_ = &mut connection_closed_future => return Err(()),
 					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
 				};
-				if peer_manager.get_peer_node_ids().iter().find(|(id, _)| *id == pubkey).is_some() {
+				if peer_manager.peer_by_node_id(&pubkey).is_some() {
 					return Ok(());
 				}
 			}
@@ -211,40 +213,4 @@ fn open_channel(
 	};
 
 	channel_manager.create_channel(peer_pubkey, channel_amt_sat, push_msat, 0, None, Some(config))
-}
-
-pub(crate) async fn connect_peer_if_necessary(
-	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManagerType>,
-) -> Result<(), ()> {
-	for (node_pubkey, _) in peer_manager.get_peer_node_ids() {
-		if node_pubkey == pubkey {
-			return Ok(());
-		}
-	}
-	let res = do_connect_peer(pubkey, peer_addr, peer_manager).await;
-	if res.is_err() {
-		println!("ERROR: failed to connect to peer");
-	}
-	res
-}
-
-pub(crate) async fn do_connect_peer(
-	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManagerType>,
-) -> Result<(), ()> {
-	match lightning_net_tokio::connect_outbound(Arc::clone(&peer_manager), pubkey, peer_addr).await
-	{
-		Some(connection_closed_future) => {
-			let mut connection_closed_future = Box::pin(connection_closed_future);
-			loop {
-				tokio::select! {
-					_ = &mut connection_closed_future => return Err(()),
-					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
-				};
-				if peer_manager.get_peer_node_ids().iter().find(|(id, _)| *id == pubkey).is_some() {
-					return Ok(());
-				}
-			}
-		},
-		None => Err(()),
-	}
 }
