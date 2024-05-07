@@ -20,7 +20,7 @@ use bitcoin::BlockHash;
 use bitcoin_bech32::WitnessProgram;
 use disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
 use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
-use lightning::chain::{Filter, Watch};
+use lightning::chain::{BestBlock, Filter, Watch};
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose};
 use lightning::ln::channelmanager::{self, RecentPaymentDetails};
@@ -36,11 +36,15 @@ use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
-use lightning::sign::{EntropySource, InMemorySigner, KeysManager, SpendableOutputDescriptor};
+use lightning::sign::{EntropySource, InMemorySigner, KeysManager};
 use lightning::util::config::UserConfig;
 use lightning::util::logger::Logger;
-use lightning::util::persist::{KVStore, MonitorUpdatingPersister};
+use lightning::util::persist::{
+	KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+};
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning::util::sweep as ldk_sweep;
 use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_background_processor::{process_events_async, GossipSync};
 use lightning_block_sync::init;
@@ -198,13 +202,26 @@ pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
 	Arc<FilesystemLogger>,
 >;
 
+pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
+	Arc<BitcoindClient>,
+	Arc<BitcoindClient>,
+	Arc<BitcoindClient>,
+	Arc<dyn Filter + Send + Sync>,
+	Arc<FilesystemStore>,
+	Arc<FilesystemLogger>,
+	Arc<KeysManager>,
+>;
+
+// Needed due to rust-lang/rust#63033.
+struct OutputSweeperWrapper(Arc<OutputSweeper>);
+
 async fn handle_ldk_events(
 	channel_manager: Arc<ChannelManager>, bitcoind_client: &BitcoindClient,
 	network_graph: &NetworkGraph, keys_manager: &KeysManager,
 	bump_tx_event_handler: &BumpTxEventHandler, peer_manager: Arc<PeerManagerType>,
 	inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
 	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
-	network: Network, event: Event,
+	output_sweeper: OutputSweeperWrapper, network: Network, event: Event,
 ) {
 	match event {
 		Event::FundingGenerationReady {
@@ -484,22 +501,8 @@ async fn handle_ldk_events(
 				forwarding_channel_manager.process_pending_htlc_forwards();
 			});
 		},
-		Event::SpendableOutputs { outputs, channel_id: _ } => {
-			// SpendableOutputDescriptors, of which outputs is a vec of, are critical to keep track
-			// of! While a `StaticOutput` descriptor is just an output to a static, well-known key,
-			// other descriptors are not currently ever regenerated for you by LDK. Once we return
-			// from this method, the descriptor will be gone, and you may lose track of some funds.
-			//
-			// Here we simply persist them to disk, with a background task running which will try
-			// to spend them regularly (possibly duplicatively/RBF'ing them). These can just be
-			// treated as normal funds where possible - they are only spendable by us and there is
-			// no rush to claim them.
-			for output in outputs {
-				let key = hex_utils::hex_str(&keys_manager.get_secure_random_bytes());
-				// Note that if the type here changes our read code needs to change as well.
-				let output: SpendableOutputDescriptor = output;
-				fs_store.write(PENDING_SPENDABLE_OUTPUT_DIR, "", &key, &output.encode()).unwrap();
-			}
+		Event::SpendableOutputs { outputs, channel_id } => {
+			output_sweeper.0.track_spendable_outputs(outputs, channel_id, false, None).unwrap();
 		},
 		Event::ChannelPending { channel_id, counterparty_node_id, .. } => {
 			println!(
@@ -757,14 +760,50 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	};
 
-	// Step 12: Sync ChannelMonitors and ChannelManager to chain tip
+	// Step 12: Initialize the OutputSweeper.
+	let (sweeper_best_block, output_sweeper) = match fs_store.read(
+		OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
+		OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+		OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	) {
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {
+			let sweeper = OutputSweeper::new(
+				channel_manager.current_best_block(),
+				broadcaster.clone(),
+				fee_estimator.clone(),
+				None,
+				keys_manager.clone(),
+				bitcoind_client.clone(),
+				fs_store.clone(),
+				logger.clone(),
+			);
+			(channel_manager.current_best_block(), sweeper)
+		},
+		Ok(mut bytes) => {
+			let read_args = (
+				broadcaster.clone(),
+				fee_estimator.clone(),
+				None,
+				keys_manager.clone(),
+				bitcoind_client.clone(),
+				fs_store.clone(),
+				logger.clone(),
+			);
+			let mut reader = io::Cursor::new(&mut bytes);
+			<(BestBlock, OutputSweeper)>::read(&mut reader, read_args)
+				.expect("Failed to deserialize OutputSweeper")
+		},
+		Err(e) => panic!("Failed to read OutputSweeper with {}", e),
+	};
+
+	// Step 13: Sync ChannelMonitors, ChannelManager and OutputSweeper to chain tip
 	let mut chain_listener_channel_monitors = Vec::new();
 	let mut cache = UnboundedCache::new();
 	let chain_tip = if restarting_node {
-		let mut chain_listeners = vec![(
-			channel_manager_blockhash,
-			&channel_manager as &(dyn chain::Listen + Send + Sync),
-		)];
+		let mut chain_listeners = vec![
+			(channel_manager_blockhash, &channel_manager as &(dyn chain::Listen + Send + Sync)),
+			(sweeper_best_block.block_hash, &output_sweeper as &(dyn chain::Listen + Send + Sync)),
+		];
 
 		for (blockhash, channel_monitor) in channelmonitors.drain(..) {
 			let outpoint = channel_monitor.get_funding_txo().0;
@@ -794,7 +833,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		polled_chain_tip
 	};
 
-	// Step 13: Give ChannelMonitors to ChainMonitor
+	// Step 14: Give ChannelMonitors to ChainMonitor
 	for item in chain_listener_channel_monitors.drain(..) {
 		let channel_monitor = item.1 .0;
 		let funding_outpoint = item.2;
@@ -804,11 +843,11 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		);
 	}
 
-	// Step 14: Optional: Initialize the P2PGossipSync
+	// Step 15: Optional: Initialize the P2PGossipSync
 	let gossip_sync =
 		Arc::new(P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger)));
 
-	// Step 15: Initialize the PeerManager
+	// Step 16: Initialize the PeerManager
 	let channel_manager: Arc<ChannelManager> = Arc::new(channel_manager);
 	let onion_message_handler = Arc::new(OnionMessageHandler {
 		messages: Arc::new(Mutex::new(VecDeque::new())),
@@ -853,7 +892,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	gossip_sync.add_utxo_lookup(Some(utxo_lookup));
 
 	// ## Running LDK
-	// Step 16: Initialize networking
+	// Step 17: Initialize networking
 
 	let peer_manager_connection_handler = peer_manager.clone();
 	let listening_port = args.ldk_peer_listening_port;
@@ -879,14 +918,17 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	});
 
-	// Step 17: Connect and Disconnect Blocks
+	// Step 18: Connect and Disconnect Blocks
+	let output_sweeper: Arc<OutputSweeper> = Arc::new(output_sweeper);
 	let channel_manager_listener = channel_manager.clone();
 	let chain_monitor_listener = chain_monitor.clone();
+	let output_sweeper_listener = output_sweeper.clone();
 	let bitcoind_block_source = bitcoind_client.clone();
 	let network = args.network;
 	tokio::spawn(async move {
 		let chain_poller = poll::ChainPoller::new(bitcoind_block_source.as_ref(), network);
-		let chain_listener = (chain_monitor_listener, channel_manager_listener);
+		let chain_listener =
+			(chain_monitor_listener, &(channel_manager_listener, output_sweeper_listener));
 		let mut spv_client = SpvClient::new(chain_tip, chain_poller, &mut cache, &chain_listener);
 		loop {
 			spv_client.poll_best_tip().await.unwrap();
@@ -925,7 +967,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound_payments.lock().unwrap().encode())
 		.unwrap();
 
-	// Step 18: Handle LDK Events
+	// Step 19: Handle LDK Events
 	let channel_manager_event_listener = Arc::clone(&channel_manager);
 	let bitcoind_client_event_listener = Arc::clone(&bitcoind_client);
 	let network_graph_event_listener = Arc::clone(&network_graph);
@@ -934,6 +976,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	let outbound_payments_event_listener = Arc::clone(&outbound_payments);
 	let fs_store_event_listener = Arc::clone(&fs_store);
 	let peer_manager_event_listener = Arc::clone(&peer_manager);
+	let output_sweeper_event_listener = Arc::clone(&output_sweeper);
 	let network = args.network;
 	let event_handler = move |event: Event| {
 		let channel_manager_event_listener = Arc::clone(&channel_manager_event_listener);
@@ -945,6 +988,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		let outbound_payments_event_listener = Arc::clone(&outbound_payments_event_listener);
 		let fs_store_event_listener = Arc::clone(&fs_store_event_listener);
 		let peer_manager_event_listener = Arc::clone(&peer_manager_event_listener);
+		let output_sweeper_event_listener = Arc::clone(&output_sweeper_event_listener);
 		async move {
 			handle_ldk_events(
 				channel_manager_event_listener,
@@ -956,6 +1000,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 				inbound_payments_event_listener,
 				outbound_payments_event_listener,
 				fs_store_event_listener,
+				OutputSweeperWrapper(output_sweeper_event_listener),
 				network,
 				event,
 			)
@@ -963,10 +1008,10 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	};
 
-	// Step 19: Persist ChannelManager and NetworkGraph
+	// Step 20: Persist ChannelManager and NetworkGraph
 	let persister = Arc::new(FilesystemStore::new(ldk_data_dir.clone().into()));
 
-	// Step 20: Background Processing
+	// Step 21: Background Processing
 	let (bp_exit, bp_exit_check) = tokio::sync::watch::channel(());
 	let background_processor = tokio::spawn(process_events_async(
 		Arc::clone(&persister),
@@ -1050,6 +1095,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	});
 
+	// TODO: remove this, since the new `OutputSweeper` was added in LDK v0.0.123.
 	tokio::spawn(sweep::periodic_sweep(
 		ldk_data_dir.clone(),
 		Arc::clone(&keys_manager),
