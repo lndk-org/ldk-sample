@@ -68,8 +68,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-pub(crate) const PENDING_SPENDABLE_OUTPUT_DIR: &'static str = "pending_spendable_outputs";
-
 #[derive(Copy, Clone)]
 pub(crate) enum HTLCStatus {
 	Pending,
@@ -1095,14 +1093,12 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	});
 
-	// TODO: remove this, since the new `OutputSweeper` was added in LDK v0.0.123.
-	tokio::spawn(sweep::periodic_sweep(
+	tokio::spawn(sweep::migrate_deprecated_spendable_outputs(
 		ldk_data_dir.clone(),
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
 		Arc::clone(&persister),
-		Arc::clone(&bitcoind_client),
-		Arc::clone(&channel_manager),
+		Arc::clone(&output_sweeper),
 	));
 
 	return node_api::Node {
