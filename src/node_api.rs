@@ -68,55 +68,7 @@ impl Node {
 	pub async fn connect_to_peer(
 		&self, pubkey: PublicKey, peer_addr: SocketAddr,
 	) -> Result<(), ()> {
-		// If we're already connected to peer, then we're good to go.
-		for (node_pubkey, _) in self.peer_manager.get_peer_node_ids() {
-			if node_pubkey == pubkey {
-				return Ok(());
-			}
-		}
-		let res = match self.do_connect_peer(pubkey, peer_addr).await {
-			Ok(_) => {
-				println!("SUCCESS: connected to peer {}", pubkey);
-				Ok(())
-			}
-			Err(e) => {
-				println!("ERROR: failed to connect to peer: {e:?}");
-				Err(())
-			}
-		};
-		res
-	}
-
-	pub async fn do_connect_peer(
-		&self, pubkey: PublicKey, peer_addr: SocketAddr,
-	) -> Result<(), ()> {
-		match lightning_net_tokio::connect_outbound(
-			Arc::clone(&self.peer_manager),
-			pubkey,
-			peer_addr,
-		)
-		.await
-		{
-			Some(connection_closed_future) => {
-				let mut connection_closed_future = Box::pin(connection_closed_future);
-				loop {
-					tokio::select! {
-						_ = &mut connection_closed_future => return Err(()),
-						_ = tokio::time::sleep(Duration::from_millis(10)) => {},
-					};
-					if self
-						.peer_manager
-						.get_peer_node_ids()
-						.iter()
-						.find(|(id, _)| *id == pubkey)
-						.is_some()
-					{
-						return Ok(());
-					}
-				}
-			}
-			None => Err(()),
-		}
+		connect_peer_if_necessary(pubkey, peer_addr, self.peer_manager.clone()).await
 	}
 
 	pub async fn open_channel(
@@ -205,6 +157,42 @@ impl Node {
 			self.bp_exit.send(()).unwrap();
 			self.background_processor.await.unwrap().unwrap();
 		}
+	}
+}
+
+pub(crate) async fn connect_peer_if_necessary(
+	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManagerType>,
+) -> Result<(), ()> {
+	for (node_pubkey, _) in peer_manager.get_peer_node_ids() {
+		if node_pubkey == pubkey {
+			return Ok(());
+		}
+	}
+	let res = do_connect_peer(pubkey, peer_addr, peer_manager).await;
+	if res.is_err() {
+		println!("ERROR: failed to connect to peer");
+	}
+	res
+}
+
+pub(crate) async fn do_connect_peer(
+	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManagerType>,
+) -> Result<(), ()> {
+	match lightning_net_tokio::connect_outbound(Arc::clone(&peer_manager), pubkey, peer_addr).await
+	{
+		Some(connection_closed_future) => {
+			let mut connection_closed_future = Box::pin(connection_closed_future);
+			loop {
+				tokio::select! {
+					_ = &mut connection_closed_future => return Err(()),
+					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
+				};
+				if peer_manager.get_peer_node_ids().iter().find(|(id, _)| *id == pubkey).is_some() {
+					return Ok(());
+				}
+			}
+		},
+		None => Err(()),
 	}
 }
 
