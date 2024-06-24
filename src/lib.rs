@@ -58,6 +58,7 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write;
+use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -176,13 +177,16 @@ pub(crate) type ChannelManager =
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
 
 // Reminder: We define the OnionMessenger as such because we need to use the OnionMessageHandler.
-// This deviates from the main ldk-sample fork.
-// This also impacts the PeerManager and GossipVerifier type definitions above.
+// This deviates from the main ldk-sample fork. This also impacts the PeerManager and
+// GossipVerifier type definitions above.
+// TODO: We should sync this with ldk-sample. Now ChannelManager implements the OnionMessageHandler
+// and we no longer need to do this.
 pub(crate) type OnionMessengerType = OnionMessenger<
 	Arc<KeysManager>,
 	Arc<KeysManager>,
 	Arc<FilesystemLogger>,
-	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>>>,
+	Arc<ChannelManager>,
+	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<KeysManager>>>,
 	Arc<OnionMessageHandler>,
 	Arc<OnionMessageHandler>,
 >;
@@ -195,11 +199,11 @@ pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
 >;
 
 async fn handle_ldk_events(
-	channel_manager: &Arc<ChannelManager>, bitcoind_client: &BitcoindClient,
+	channel_manager: Arc<ChannelManager>, bitcoind_client: &BitcoindClient,
 	network_graph: &NetworkGraph, keys_manager: &KeysManager,
-	bump_tx_event_handler: &BumpTxEventHandler,
+	bump_tx_event_handler: &BumpTxEventHandler, peer_manager: Arc<PeerManagerType>,
 	inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
-	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: &Arc<FilesystemStore>,
+	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
 	network: Network, event: Event,
 ) {
 	match event {
@@ -250,7 +254,7 @@ async fn handle_ldk_events(
 				print!("> ");
 				io::stdout().flush().unwrap();
 			}
-		}
+		},
 		Event::PaymentClaimable {
 			payment_hash,
 			purpose,
@@ -267,12 +271,14 @@ async fn handle_ldk_events(
 				payment_hash, amount_msat,
 			);
 			let payment_preimage = match purpose {
-				PaymentPurpose::InvoicePayment { payment_preimage, .. } => payment_preimage,
+				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => payment_preimage,
+				PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => payment_preimage,
+				PaymentPurpose::Bolt12RefundPayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
 			};
 
 			channel_manager.claim_funds(payment_preimage.unwrap());
-		}
+		},
 		Event::PaymentClaimed {
 			payment_hash,
 			purpose,
@@ -288,9 +294,15 @@ async fn handle_ldk_events(
 			print!("> ");
 			io::stdout().flush().unwrap();
 			let (payment_preimage, payment_secret) = match purpose {
-				PaymentPurpose::InvoicePayment { payment_preimage, payment_secret, .. } => {
+				PaymentPurpose::Bolt11InvoicePayment {
+					payment_preimage, payment_secret, ..
+				} => (payment_preimage, Some(payment_secret)),
+				PaymentPurpose::Bolt12OfferPayment { payment_preimage, payment_secret, .. } => {
 					(payment_preimage, Some(payment_secret))
-				}
+				},
+				PaymentPurpose::Bolt12RefundPayment {
+					payment_preimage, payment_secret, ..
+				} => (payment_preimage, Some(payment_secret)),
 				PaymentPurpose::SpontaneousPayment(preimage) => (Some(preimage), None),
 			};
 			let mut inbound = inbound_payments.lock().unwrap();
@@ -300,7 +312,7 @@ async fn handle_ldk_events(
 					payment.status = HTLCStatus::Succeeded;
 					payment.preimage = payment_preimage;
 					payment.secret = payment_secret;
-				}
+				},
 				Entry::Vacant(e) => {
 					e.insert(PaymentInfo {
 						preimage: payment_preimage,
@@ -308,10 +320,10 @@ async fn handle_ldk_events(
 						status: HTLCStatus::Succeeded,
 						amt_msat: MillisatAmount(Some(amount_msat)),
 					});
-				}
+				},
 			}
 			fs_store.write("", "", INBOUND_PAYMENTS_FNAME, &inbound.encode()).unwrap();
-		}
+		},
 		Event::PaymentSent {
 			payment_preimage, payment_hash, fee_paid_msat, payment_id, ..
 		} => {
@@ -337,7 +349,7 @@ async fn handle_ldk_events(
 				}
 			}
 			fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound.encode()).unwrap();
-		}
+		},
 		Event::OpenChannelRequest {
 			ref temporary_channel_id, ref counterparty_node_id, ..
 		} => {
@@ -364,11 +376,11 @@ async fn handle_ldk_events(
 					hex_utils::hex_str(&counterparty_node_id.serialize()),
 				);
 			}
-		}
-		Event::PaymentPathSuccessful { .. } => {}
-		Event::PaymentPathFailed { .. } => {}
-		Event::ProbeSuccessful { .. } => {}
-		Event::ProbeFailed { .. } => {}
+		},
+		Event::PaymentPathSuccessful { .. } => {},
+		Event::PaymentPathFailed { .. } => {},
+		Event::ProbeSuccessful { .. } => {},
+		Event::ProbeFailed { .. } => {},
 		Event::PaymentFailed { payment_hash, reason, payment_id, .. } => {
 			print!(
 				"\nEVENT: Failed to send payment to payment hash {}: {:?}",
@@ -384,7 +396,7 @@ async fn handle_ldk_events(
 				payment.status = HTLCStatus::Failed;
 			}
 			fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound.encode()).unwrap();
-		}
+		},
 		Event::InvoiceRequestFailed { payment_id } => {
 			print!("\nEVENT: Failed to request invoice to send payment with id {}", payment_id);
 			print!("> ");
@@ -396,13 +408,16 @@ async fn handle_ldk_events(
 				payment.status = HTLCStatus::Failed;
 			}
 			fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound.encode()).unwrap();
-		}
+		},
 		Event::PaymentForwarded {
 			prev_channel_id,
 			next_channel_id,
-			fee_earned_msat,
+			total_fee_earned_msat,
 			claim_from_onchain_tx,
 			outbound_amount_forwarded_msat,
+			skimmed_fee_msat: _,
+			prev_user_channel_id: _,
+			next_user_channel_id: _,
 		} => {
 			let read_only_network_graph = network_graph.read_only();
 			let nodes = read_only_network_graph.nodes();
@@ -419,10 +434,10 @@ async fn handle_ldk_events(
 								None => "unnamed node".to_string(),
 								Some(announcement) => {
 									format!("node {}", announcement.alias)
-								}
+								},
 							},
 						}
-					}
+					},
 				},
 			};
 			let channel_str = |channel_id: &Option<ChannelId>| {
@@ -445,7 +460,7 @@ async fn handle_ldk_events(
 			} else {
 				"?".to_string()
 			};
-			if let Some(fee_earned) = fee_earned_msat {
+			if let Some(fee_earned) = total_fee_earned_msat {
 				println!(
 					"\nEVENT: Forwarded payment for {} msat{}{}, earning {} msat {}",
 					amt_args, from_prev_str, to_next_str, fee_earned, from_onchain_str
@@ -458,8 +473,8 @@ async fn handle_ldk_events(
 			}
 			print!("> ");
 			io::stdout().flush().unwrap();
-		}
-		Event::HTLCHandlingFailed { .. } => {}
+		},
+		Event::HTLCHandlingFailed { .. } => {},
 		Event::PendingHTLCsForwardable { time_forwardable } => {
 			let forwarding_channel_manager = channel_manager.clone();
 			let min = time_forwardable.as_millis() as u64;
@@ -468,7 +483,7 @@ async fn handle_ldk_events(
 				tokio::time::sleep(Duration::from_millis(millis_to_sleep)).await;
 				forwarding_channel_manager.process_pending_htlc_forwards();
 			});
-		}
+		},
 		Event::SpendableOutputs { outputs, channel_id: _ } => {
 			// SpendableOutputDescriptors, of which outputs is a vec of, are critical to keep track
 			// of! While a `StaticOutput` descriptor is just an output to a static, well-known key,
@@ -485,14 +500,14 @@ async fn handle_ldk_events(
 				let output: SpendableOutputDescriptor = output;
 				fs_store.write(PENDING_SPENDABLE_OUTPUT_DIR, "", &key, &output.encode()).unwrap();
 			}
-		}
+		},
 		Event::ChannelPending { channel_id, counterparty_node_id, .. } => {
 			println!(
 				"\nEVENT: Channel {} with peer {} is pending awaiting funding lock-in!",
 				channel_id,
 				hex_utils::hex_str(&counterparty_node_id.serialize()),
 			);
-		}
+		},
 		Event::ChannelReady {
 			ref channel_id,
 			user_channel_id: _,
@@ -504,7 +519,7 @@ async fn handle_ldk_events(
 				channel_id,
 				hex_utils::hex_str(&counterparty_node_id.serialize()),
 			);
-		}
+		},
 		Event::ChannelClosed {
 			channel_id,
 			reason,
@@ -519,14 +534,28 @@ async fn handle_ldk_events(
 				counterparty_node_id.map(|id| format!("{}", id)).unwrap_or("".to_owned()),
 				reason
 			);
-		}
+		},
 		Event::DiscardFunding { .. } => {
 			// A "real" node should probably "lock" the UTXOs spent in funding transactions until
 			// the funding transaction either confirms, or this event is generated.
-		}
-		Event::HTLCIntercepted { .. } => {}
+		},
+		Event::HTLCIntercepted { .. } => {},
 		Event::BumpTransaction(event) => bump_tx_event_handler.handle_event(&event),
-		Event::ConnectionNeeded { .. } => {}
+		Event::ConnectionNeeded { node_id, addresses } => {
+			tokio::spawn(async move {
+				for address in addresses {
+					if let Ok(sockaddrs) = address.to_socket_addrs() {
+						for addr in sockaddrs {
+							let pm = Arc::clone(&peer_manager);
+							if node_api::connect_peer_if_necessary(node_id, addr, pm).await.is_ok()
+							{
+								return;
+							}
+						}
+					}
+				}
+			});
+		},
 	}
 }
 
@@ -557,7 +586,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Ok(client) => Arc::new(client),
 		Err(e) => {
 			panic!("Failed to connect to bitcoind client: {}", e);
-		}
+		},
 	};
 
 	// Check that the bitcoind we've connected to is running the network we expect
@@ -603,10 +632,10 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 			Ok(mut f) => {
 				Write::write_all(&mut f, &key).expect("Failed to write node keys seed to disk");
 				f.sync_all().expect("Failed to sync node keys seed to disk");
-			}
+			},
 			Err(e) => {
 				panic!("ERROR: Unable to create keys seed file {}: {}", keys_seed_path, e);
-			}
+			},
 		}
 		key
 	};
@@ -672,7 +701,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	let router = Arc::new(DefaultRouter::new(
 		network_graph.clone(),
 		logger.clone(),
-		keys_manager.get_secure_random_bytes(),
+		keys_manager.clone(),
 		scorer.clone(),
 		scoring_fee_params,
 	));
@@ -708,7 +737,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 			restarting_node = false;
 
 			let polled_best_block = polled_chain_tip.to_best_block();
-			let polled_best_block_hash = polled_best_block.block_hash();
+			let polled_best_block_hash = polled_best_block.block_hash;
 			let chain_params =
 				ChainParameters { network: args.network, best_block: polled_best_block };
 			let fresh_channel_manager = channelmanager::ChannelManager::new(
@@ -792,7 +821,8 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
-		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph))),
+		Arc::clone(&channel_manager),
+		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager))),
 		Arc::clone(&onion_message_handler),
 		Arc::clone(&onion_message_handler),
 	));
@@ -903,6 +933,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	let inbound_payments_event_listener = Arc::clone(&inbound_payments);
 	let outbound_payments_event_listener = Arc::clone(&outbound_payments);
 	let fs_store_event_listener = Arc::clone(&fs_store);
+	let peer_manager_event_listener = Arc::clone(&peer_manager);
 	let network = args.network;
 	let event_handler = move |event: Event| {
 		let channel_manager_event_listener = Arc::clone(&channel_manager_event_listener);
@@ -913,16 +944,18 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		let inbound_payments_event_listener = Arc::clone(&inbound_payments_event_listener);
 		let outbound_payments_event_listener = Arc::clone(&outbound_payments_event_listener);
 		let fs_store_event_listener = Arc::clone(&fs_store_event_listener);
+		let peer_manager_event_listener = Arc::clone(&peer_manager_event_listener);
 		async move {
 			handle_ldk_events(
-				&channel_manager_event_listener,
+				channel_manager_event_listener,
 				&bitcoind_client_event_listener,
 				&network_graph_event_listener,
 				&keys_manager_event_listener,
 				&bump_tx_event_handler,
+				peer_manager_event_listener,
 				inbound_payments_event_listener,
 				outbound_payments_event_listener,
-				&fs_store_event_listener,
+				fs_store_event_listener,
 				network,
 				event,
 			)
@@ -969,12 +1002,11 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 			interval.tick().await;
 			match disk::read_channel_peer_data(Path::new(&peer_data_path)) {
 				Ok(info) => {
-					let peers = &connect_pm.get_peer_node_ids();
 					for node_id in connect_cm
 						.list_channels()
 						.iter()
 						.map(|chan| chan.counterparty.node_id)
-						.filter(|id| !peers.iter().any(|(pk, _)| id == pk))
+						.filter(|id| connect_pm.peer_by_node_id(id).is_none())
 					{
 						if stop_connect.load(Ordering::Acquire) {
 							return;
@@ -990,7 +1022,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 							}
 						}
 					}
-				}
+				},
 				Err(e) => println!("ERROR: errored reading channel peer info from disk: {:?}", e),
 			}
 		}

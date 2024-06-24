@@ -1,20 +1,26 @@
 use crate::disk::FilesystemLogger;
 use crate::ChannelManager;
 use bitcoin::secp256k1::{KeyPair, PublicKey, Secp256k1};
-use core::convert::Infallible;
+use lightning::blinded_path::payment::PaymentContext;
 use lightning::blinded_path::payment::{
-	ForwardNode, ForwardTlvs, PaymentConstraints, PaymentRelay, ReceiveTlvs,
+	Bolt12OfferContext, ForwardNode, ForwardTlvs, PaymentConstraints, PaymentRelay, ReceiveTlvs,
 };
 use lightning::blinded_path::BlindedPath;
+use lightning::offers::invoice_request::InvoiceRequestFields;
+
 use lightning::io::Read;
+use lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA;
 use lightning::ln::features::BlindedHopFeatures;
 use lightning::ln::msgs::DecodeError;
+use lightning::offers::invoice::UnsignedBolt12Invoice;
+use lightning::offers::offer::OfferId;
 use lightning::onion_message::messenger::{CustomOnionMessageHandler, PendingOnionMessage};
 use lightning::onion_message::offers::{OffersMessage, OffersMessageHandler};
 use lightning::onion_message::packet::OnionMessageContents;
-use lightning::sign::KeysManager;
+use lightning::sign::{EntropySource, KeysManager};
 use lightning::util::logger::Logger;
 use lightning::util::ser::{Writeable, Writer};
+use lightning::util::string::UntrustedString;
 use lightning::{log_error, log_info};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -89,6 +95,16 @@ impl OffersMessageHandler for OnionMessageHandler {
 						max_cltv_expiry: u32::max_value(),
 						htlc_minimum_msat,
 					},
+					payment_context: PaymentContext::Bolt12Offer(Bolt12OfferContext {
+						offer_id: OfferId(self.keys_manager.get_secure_random_bytes()),
+						invoice_request: InvoiceRequestFields {
+							payer_id: invoice_request.payer_id(),
+							quantity: invoice_request.quantity(),
+							payer_note_truncated: invoice_request
+								.payer_note()
+								.map(|note| UntrustedString(note.to_string())),
+						},
+					}),
 				};
 
 				let forwarding_tlv = ForwardTlvs {
@@ -119,6 +135,7 @@ impl OffersMessageHandler for OnionMessageHandler {
 					self.node_id,
 					payee_tlvs,
 					chans[0].inbound_htlc_maximum_msat.unwrap(),
+					MIN_FINAL_CLTV_EXPIRY_DELTA,
 					&*self.keys_manager,
 					&secp_ctx,
 				)
@@ -137,17 +154,17 @@ impl OffersMessageHandler for OnionMessageHandler {
 						.fallback_v0_p2wpkh(&wpubkey_hash)
 						.build()
 						.unwrap()
-						.sign::<_, Infallible>(|message| {
+						.sign(|message: &UnsignedBolt12Invoice| {
 							Ok(secp_ctx
 								.sign_schnorr_no_aux_rand(message.as_ref().as_digest(), &keys))
 						})
 						.expect("failed verifying signature"),
 				));
-			}
+			},
 			_ => {
 				log_error!(self.logger, "Unsupported offers message type");
 				return None;
-			}
+			},
 		};
 	}
 

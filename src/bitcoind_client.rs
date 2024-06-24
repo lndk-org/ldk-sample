@@ -338,7 +338,7 @@ impl WalletSource for BitcoindClient {
 									)
 								})
 								.ok()
-						}
+						},
 						// TODO: Add `Utxo::new_v1_p2tr` upstream.
 						WitnessVersion::V1 => {
 							bitcoin::hashes::hash160::Hash::from_slice(wp.program().as_bytes())
@@ -357,7 +357,7 @@ impl WalletSource for BitcoindClient {
 									}
 								})
 								.ok()
-						}
+						},
 						_ => None,
 					},
 					_ => None,

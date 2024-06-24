@@ -33,6 +33,7 @@ impl Logger for FilesystemLogger {
 		if record.level < self.level {
 			return;
 		}
+
 		let raw_log = record.args.to_string();
 		let log = format!(
 			"{} {:<5} [{}:{}] {}\n",
@@ -74,7 +75,7 @@ pub(crate) fn read_channel_peer_data(
 		match peer_utils::parse_peer_info(line.unwrap()) {
 			Ok((pubkey, socket_addr)) => {
 				peer_data.insert(pubkey, socket_addr);
-			}
+			},
 			Err(e) => return Err(e),
 		}
 	}
