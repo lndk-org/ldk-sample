@@ -7,11 +7,14 @@ use crate::{
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::Network;
-use lightning::blinded_path::BlindedPath;
-use lightning::ln::ChannelId;
+use lightning::blinded_path::message::{
+	BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext,
+};
+use lightning::ln::types::ChannelId;
+use lightning::offers::nonce::Nonce;
 use lightning::offers::offer::{Offer, Quantity};
 use lightning::offers::parse::Bolt12SemanticError;
-use lightning::onion_message::messenger::Destination;
+use lightning::onion_message::messenger::{Destination, MessageSendInstructions};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
 use lightning::sign::KeysManager;
@@ -50,7 +53,7 @@ pub struct Node {
 	pub(crate) onion_messenger: Arc<OnionMessenger>,
 	pub(crate) peer_manager: Arc<PeerManagerType>,
 	pub(crate) bp_exit: Sender<()>,
-	pub(crate) background_processor: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+	pub(crate) background_processor: tokio::task::JoinHandle<Result<(), lightning::io::Error>>,
 	pub(crate) stop_listen_connect: Arc<AtomicBool>,
 
 	// Config values
@@ -109,11 +112,11 @@ impl Node {
 			return Err(());
 		}
 		let destination = Destination::Node(intermediate_nodes.pop().unwrap());
-		match self.onion_messenger.send_onion_message(
-			UserOnionMessageContents { tlv_type, data },
-			destination,
-			None,
-		) {
+		let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+		match self
+			.onion_messenger
+			.send_onion_message(UserOnionMessageContents { tlv_type, data }, instructions)
+		{
 			Ok(success) => {
 				println!("SUCCESS: forwarded onion message to first hop {:?}", success);
 				Ok(())
@@ -128,15 +131,29 @@ impl Node {
 	// Build an offer for receiving payments at this node. path_pubkeys lists the nodes the path will contain,
 	// starting with the introduction node and ending in the destination node (the current node).
 	pub async fn create_offer(
-		&self, path_pubkeys: &[PublicKey], network: Network, msats: u64, quantity: Quantity,
+		&self, intermediate_nodes: &[PublicKey], network: Network, msats: u64, quantity: Quantity,
 		expiration: SystemTime,
 	) -> Result<Offer, Bolt12SemanticError> {
 		let secp_ctx = Secp256k1::new();
-		let path =
-			BlindedPath::new_for_message(path_pubkeys, &*self.keys_manager, &secp_ctx).unwrap();
+		let payee_node_id = intermediate_nodes[0];
+		let intermediate_nodes = intermediate_nodes
+			.iter()
+			.map(|node| MessageForwardNode { node_id: *node, short_channel_id: None })
+			.collect::<Vec<_>>();
+		let context = MessageContext::Offers(OffersContext::InvoiceRequest {
+			nonce: Nonce::from_entropy_source(&*self.keys_manager),
+		});
+		let path = BlindedMessagePath::new(
+			&intermediate_nodes,
+			payee_node_id,
+			context,
+			&*self.keys_manager,
+			&secp_ctx,
+		)
+		.unwrap();
 
 		self.channel_manager
-			.create_offer_builder()
+			.create_offer_builder(None)
 			.unwrap()
 			.description("testing offer".to_string())
 			.amount_msats(msats)
@@ -205,7 +222,7 @@ fn open_channel(
 	let config = UserConfig {
 		channel_handshake_limits: ChannelHandshakeLimits { ..Default::default() },
 		channel_handshake_config: ChannelHandshakeConfig {
-			announced_channel,
+			announce_for_forwarding: announced_channel,
 			negotiate_anchors_zero_fee_htlc_tx: with_anchors,
 			..Default::default()
 		},

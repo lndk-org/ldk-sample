@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod bitcoind_client;
+mod cli;
 pub mod config;
 mod convert;
 mod disk;
@@ -14,7 +15,8 @@ use crate::bitcoind_client::BitcoindClient;
 use crate::disk::FilesystemLogger;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode;
-use bitcoin::network::constants::Network;
+use bitcoin::io;
+use bitcoin::network::Network;
 use bitcoin::BlockHash;
 use bitcoin_bech32::WitnessProgram;
 use disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
@@ -28,7 +30,9 @@ use lightning::ln::channelmanager::{
 };
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
-use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
+// use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
+use lightning::ln::types::ChannelId;
+use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::log_info;
 use lightning::onion_message::messenger::{DefaultMessageRouter, SimpleArcOnionMessenger};
 use lightning::routing::gossip;
@@ -36,6 +40,7 @@ use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::sign::{EntropySource, InMemorySigner, KeysManager};
+// use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::util::config::UserConfig;
 use lightning::util::logger::Logger;
 use lightning::util::persist::{
@@ -59,8 +64,7 @@ use std::convert::TryInto;
 use std::fmt;
 use std::fs;
 use std::fs::File;
-use std::io;
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,7 +81,7 @@ pub(crate) enum HTLCStatus {
 impl_writeable_tlv_based_enum!(HTLCStatus,
 	(0, Pending) => {},
 	(1, Succeeded) => {},
-	(2, Failed) => {};
+	(2, Failed) => {},
 );
 
 pub(crate) struct MillisatAmount(Option<u64>);
@@ -99,7 +103,7 @@ impl Readable for MillisatAmount {
 }
 
 impl Writeable for MillisatAmount {
-	fn write<W: Writer>(&self, w: &mut W) -> Result<(), std::io::Error> {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		self.0.write(w)
 	}
 }
@@ -146,6 +150,8 @@ type ChainMonitor = chainmonitor::ChainMonitor<
 			Arc<FilesystemLogger>,
 			Arc<KeysManager>,
 			Arc<KeysManager>,
+			Arc<BitcoindClient>,
+			Arc<BitcoindClient>,
 		>,
 	>,
 >;
@@ -244,18 +250,17 @@ async fn handle_ldk_events(
 				encode::deserialize(&hex_utils::to_vec(&signed_tx.hex).unwrap()).unwrap();
 			// Give the funding transaction back to LDK for opening the channel.
 			if channel_manager
-				.funding_transaction_generated(
-					&temporary_channel_id,
-					&counterparty_node_id,
-					final_tx,
-				)
+				.funding_transaction_generated(temporary_channel_id, counterparty_node_id, final_tx)
 				.is_err()
 			{
 				println!(
 					"\nERROR: Channel went away before we could fund it. The peer disconnected or refused the channel.");
 				print!("> ");
-				io::stdout().flush().unwrap();
+				std::io::stdout().flush().unwrap();
 			}
+		},
+		Event::FundingTxBroadcastSafe { .. } => {
+			// We don't use the manual broadcasting feature, so this event should never be seen.
 		},
 		Event::PaymentClaimable {
 			payment_hash,
@@ -272,6 +277,8 @@ async fn handle_ldk_events(
 				"\nEVENT: received payment from payment hash {} of {} millisatoshis",
 				payment_hash, amount_msat,
 			);
+			print!("> ");
+			std::io::stdout().flush().unwrap();
 			let payment_preimage = match purpose {
 				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => payment_preimage,
 				PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => payment_preimage,
@@ -281,20 +288,13 @@ async fn handle_ldk_events(
 
 			channel_manager.claim_funds(payment_preimage.unwrap());
 		},
-		Event::PaymentClaimed {
-			payment_hash,
-			purpose,
-			amount_msat,
-			receiver_node_id: _,
-			htlcs: _,
-			sender_intended_total_msat: _,
-		} => {
+		Event::PaymentClaimed { payment_hash, purpose, amount_msat, .. } => {
 			println!(
 				"\nEVENT: claimed payment from payment hash {} of {} millisatoshis",
 				payment_hash, amount_msat,
 			);
 			print!("> ");
-			io::stdout().flush().unwrap();
+			std::io::stdout().flush().unwrap();
 			let (payment_preimage, payment_secret) = match purpose {
 				PaymentPurpose::Bolt11InvoicePayment {
 					payment_preimage, payment_secret, ..
@@ -347,7 +347,7 @@ async fn handle_ldk_events(
 						payment_preimage
 					);
 					print!("> ");
-					io::stdout().flush().unwrap();
+					std::io::stdout().flush().unwrap();
 				}
 			}
 			fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound.encode()).unwrap();
@@ -378,19 +378,30 @@ async fn handle_ldk_events(
 					hex_utils::hex_str(&counterparty_node_id.serialize()),
 				);
 			}
+			print!("> ");
+			std::io::stdout().flush().unwrap();
 		},
 		Event::PaymentPathSuccessful { .. } => {},
 		Event::PaymentPathFailed { .. } => {},
 		Event::ProbeSuccessful { .. } => {},
 		Event::ProbeFailed { .. } => {},
 		Event::PaymentFailed { payment_hash, reason, payment_id, .. } => {
-			print!(
-				"\nEVENT: Failed to send payment to payment hash {}: {:?}",
-				payment_hash,
-				if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
-			);
+			if let Some(hash) = payment_hash {
+				print!(
+					"\nEVENT: Failed to send payment to payment ID {}, payment hash {}: {:?}",
+					payment_id,
+					hash,
+					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
+				);
+			} else {
+				print!(
+					"\nEVENT: Failed fetch invoice for payment ID {}: {:?}",
+					payment_id,
+					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
+				);
+			}
 			print!("> ");
-			io::stdout().flush().unwrap();
+			std::io::stdout().flush().unwrap();
 
 			let mut outbound = outbound_payments.lock().unwrap();
 			if outbound.payments.contains_key(&payment_id) {
@@ -399,17 +410,8 @@ async fn handle_ldk_events(
 			}
 			fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound.encode()).unwrap();
 		},
-		Event::InvoiceRequestFailed { payment_id } => {
-			print!("\nEVENT: Failed to request invoice to send payment with id {}", payment_id);
-			print!("> ");
-			io::stdout().flush().unwrap();
-
-			let mut outbound = outbound_payments.lock().unwrap();
-			if outbound.payments.contains_key(&payment_id) {
-				let payment = outbound.payments.get_mut(&payment_id).unwrap();
-				payment.status = HTLCStatus::Failed;
-			}
-			fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound.encode()).unwrap();
+		Event::InvoiceReceived { .. } => {
+			// We don't use the manual invoice payment logic, so this event should never be seen.
 		},
 		Event::PaymentForwarded {
 			prev_channel_id,
@@ -435,7 +437,7 @@ async fn handle_ldk_events(
 							Some(node) => match &node.announcement_info {
 								None => "unnamed node".to_string(),
 								Some(announcement) => {
-									format!("node {}", announcement.alias)
+									format!("node {}", announcement.alias())
 								},
 							},
 						}
@@ -474,7 +476,7 @@ async fn handle_ldk_events(
 				);
 			}
 			print!("> ");
-			io::stdout().flush().unwrap();
+			std::io::stdout().flush().unwrap();
 		},
 		Event::HTLCHandlingFailed { .. } => {},
 		Event::PendingHTLCsForwardable { time_forwardable } => {
@@ -495,6 +497,8 @@ async fn handle_ldk_events(
 				channel_id,
 				hex_utils::hex_str(&counterparty_node_id.serialize()),
 			);
+			print!("> ");
+			std::io::stdout().flush().unwrap();
 		},
 		Event::ChannelReady {
 			ref channel_id,
@@ -507,6 +511,8 @@ async fn handle_ldk_events(
 				channel_id,
 				hex_utils::hex_str(&counterparty_node_id.serialize()),
 			);
+			print!("> ");
+			std::io::stdout().flush().unwrap();
 		},
 		Event::ChannelClosed {
 			channel_id,
@@ -522,12 +528,22 @@ async fn handle_ldk_events(
 				counterparty_node_id.map(|id| format!("{}", id)).unwrap_or("".to_owned()),
 				reason
 			);
+			print!("> ");
+			std::io::stdout().flush().unwrap();
 		},
 		Event::DiscardFunding { .. } => {
 			// A "real" node should probably "lock" the UTXOs spent in funding transactions until
 			// the funding transaction either confirms, or this event is generated.
 		},
 		Event::HTLCIntercepted { .. } => {},
+		Event::OnionMessageIntercepted { .. } => {
+			// We don't use the onion message interception feature, so this event should never be
+			// seen.
+		},
+		Event::OnionMessagePeerConnected { .. } => {
+			// We don't use the onion message interception feature, so we have no use for this
+			// event.
+		},
 		Event::BumpTransaction(event) => bump_tx_event_handler.handle_event(&event),
 		Event::ConnectionNeeded { node_id, addresses } => {
 			tokio::spawn(async move {
@@ -618,7 +634,8 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		thread_rng().fill_bytes(&mut key);
 		match File::create(keys_seed_path.clone()) {
 			Ok(mut f) => {
-				Write::write_all(&mut f, &key).expect("Failed to write node keys seed to disk");
+				std::io::Write::write_all(&mut f, &key)
+					.expect("Failed to write node keys seed to disk");
 				f.sync_all().expect("Failed to sync node keys seed to disk");
 			},
 			Err(e) => {
@@ -645,6 +662,8 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		1000,
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
+		Arc::clone(&bitcoind_client),
+		Arc::clone(&bitcoind_client),
 	));
 	// Alternatively, you can use the `FilesystemStore` as a `Persist` directly, at the cost of
 	// larger `ChannelMonitor` update writes (but no deletion or cleanup):
@@ -660,9 +679,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	));
 
 	// Step 7: Read ChannelMonitor state from disk
-	let mut channelmonitors = persister
-		.read_all_channel_monitors_with_updates(&bitcoind_client, &bitcoind_client)
-		.unwrap();
+	let mut channelmonitors = persister.read_all_channel_monitors_with_updates().unwrap();
 	// If you are using the `FilesystemStore` as a `Persist` directly, use
 	// `lightning::util::persist::read_channel_monitors` like this:
 	//read_channel_monitors(Arc::clone(&persister), Arc::clone(&keys_manager), Arc::clone(&keys_manager)).unwrap();
@@ -702,7 +719,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	user_config.accept_forwards_to_priv_channels = true;
 	let mut restarting_node = true;
 	let (channel_manager_blockhash, channel_manager) = {
-		if let Ok(mut f) = fs::File::open(format!("{}/manager", ldk_data_dir.clone())) {
+		if let Ok(f) = fs::File::open(format!("{}/manager", ldk_data_dir.clone())) {
 			let mut channel_monitor_mut_references = Vec::new();
 			for (_, channel_monitor) in channelmonitors.iter_mut() {
 				channel_monitor_mut_references.push(channel_monitor);
@@ -719,7 +736,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 				user_config,
 				channel_monitor_mut_references,
 			);
-			<(BlockHash, ChannelManager)>::read(&mut f, read_args).unwrap()
+			<(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args).unwrap()
 		} else {
 			// We're starting a fresh node.
 			restarting_node = false;
@@ -840,6 +857,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&logger),
 		Arc::clone(&channel_manager),
 		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager))),
+		Arc::clone(&channel_manager),
 		Arc::clone(&channel_manager),
 		IgnoringMessageHandler {},
 	));
@@ -983,6 +1001,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 				event,
 			)
 			.await;
+			Ok(())
 		}
 	};
 
@@ -996,6 +1015,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		event_handler,
 		chain_monitor.clone(),
 		channel_manager.clone(),
+		Some(onion_messenger.clone()),
 		GossipSync::p2p(gossip_sync.clone()),
 		peer_manager.clone(),
 		logger.clone(),
@@ -1063,7 +1083,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 			// Don't bother trying to announce if we don't have any public channls, though our
 			// peers should drop such an announcement anyway. Note that announcement may not
 			// propagate until we have a channel with 6+ confirmations.
-			if chan_man.list_channels().iter().any(|chan| chan.is_public) {
+			if chan_man.list_channels().iter().any(|chan| chan.is_announced) {
 				peer_man.broadcast_node_announcement(
 					[0; 3],
 					ldk_announced_node_name,
