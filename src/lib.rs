@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 pub mod bitcoind_client;
-mod cli;
 pub mod config;
 mod convert;
 mod disk;
