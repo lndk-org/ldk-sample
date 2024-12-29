@@ -1,15 +1,15 @@
 use crate::disk::{persist_channel_peer, FilesystemLogger};
-use crate::onion::{OnionMessageHandler, UserOnionMessageContents};
+use crate::onion::UserOnionMessageContents;
 use crate::{
-	BitcoindClient, ChainMonitor, ChannelManager, NetworkGraph, OnionMessengerType,
-	P2PGossipSyncType, PeerManagerType,
+	BitcoindClient, ChainMonitor, ChannelManager, NetworkGraph, OnionMessenger, P2PGossipSyncType,
+	PeerManagerType,
 };
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::Network;
 use lightning::blinded_path::BlindedPath;
 use lightning::ln::ChannelId;
-use lightning::offers::offer::{Offer, OfferBuilder, Quantity};
+use lightning::offers::offer::{Offer, Quantity};
 use lightning::offers::parse::Bolt12SemanticError;
 use lightning::onion_message::messenger::Destination;
 use lightning::routing::router::DefaultRouter;
@@ -47,8 +47,7 @@ pub struct Node {
 	pub(crate) scorer: Arc<RwLock<Scorer>>,
 	pub(crate) channel_manager: Arc<ChannelManager>,
 	pub(crate) gossip_sync: Arc<P2PGossipSyncType>,
-	pub(crate) onion_messenger: Arc<OnionMessengerType>,
-	pub onion_message_handler: Arc<OnionMessageHandler>,
+	pub(crate) onion_messenger: Arc<OnionMessenger>,
 	pub(crate) peer_manager: Arc<PeerManagerType>,
 	pub(crate) bp_exit: Sender<()>,
 	pub(crate) background_processor: tokio::task::JoinHandle<Result<(), std::io::Error>>,
@@ -135,9 +134,10 @@ impl Node {
 		let secp_ctx = Secp256k1::new();
 		let path =
 			BlindedPath::new_for_message(path_pubkeys, &*self.keys_manager, &secp_ctx).unwrap();
-		let (pubkey, _) = self.get_node_info();
 
-		OfferBuilder::new(pubkey)
+		self.channel_manager
+			.create_offer_builder()
+			.unwrap()
 			.description("testing offer".to_string())
 			.amount_msats(msats)
 			.chain(network)
