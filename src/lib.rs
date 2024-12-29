@@ -12,7 +12,6 @@ mod sweep;
 
 use crate::bitcoind_client::BitcoindClient;
 use crate::disk::FilesystemLogger;
-use crate::onion::OnionMessageHandler;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode;
 use bitcoin::network::constants::Network;
@@ -31,7 +30,7 @@ use lightning::ln::msgs::DecodeError;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
 use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::log_info;
-use lightning::onion_message::messenger::{DefaultMessageRouter, OnionMessenger};
+use lightning::onion_message::messenger::{DefaultMessageRouter, SimpleArcOnionMessenger};
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::router::DefaultRouter;
@@ -55,7 +54,7 @@ use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::{thread_rng, Rng};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt;
 use std::fs;
@@ -167,7 +166,7 @@ pub(crate) type PeerManagerType = PeerManager<
 	SocketDescriptor,
 	Arc<ChannelManager>,
 	Arc<P2PGossipSyncType>,
-	Arc<OnionMessengerType>,
+	Arc<OnionMessenger>,
 	Arc<FilesystemLogger>,
 	IgnoringMessageHandler,
 	Arc<KeysManager>,
@@ -178,20 +177,8 @@ pub(crate) type ChannelManager =
 
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
 
-// Reminder: We define the OnionMessenger as such because we need to use the OnionMessageHandler.
-// This deviates from the main ldk-sample fork. This also impacts the PeerManager and
-// GossipVerifier type definitions above.
-// TODO: We should sync this with ldk-sample. Now ChannelManager implements the OnionMessageHandler
-// and we no longer need to do this.
-pub(crate) type OnionMessengerType = OnionMessenger<
-	Arc<KeysManager>,
-	Arc<KeysManager>,
-	Arc<FilesystemLogger>,
-	Arc<ChannelManager>,
-	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<KeysManager>>>,
-	Arc<OnionMessageHandler>,
-	Arc<OnionMessageHandler>,
->;
+type OnionMessenger =
+	SimpleArcOnionMessenger<ChainMonitor, BitcoindClient, BitcoindClient, FilesystemLogger>;
 
 pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
 	Arc<BitcoindClient>,
@@ -847,21 +834,14 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 
 	// Step 16: Initialize the PeerManager
 	let channel_manager: Arc<ChannelManager> = Arc::new(channel_manager);
-	let onion_message_handler = Arc::new(OnionMessageHandler {
-		messages: Arc::new(Mutex::new(VecDeque::new())),
-		logger: Arc::clone(&logger),
-		keys_manager: Arc::clone(&keys_manager),
-		channel_manager: channel_manager.clone(),
-		node_id: channel_manager.get_our_node_id(),
-	});
-	let onion_messenger: Arc<OnionMessengerType> = Arc::new(OnionMessenger::new(
+	let onion_messenger: Arc<OnionMessenger> = Arc::new(OnionMessenger::new(
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
 		Arc::clone(&channel_manager),
 		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager))),
-		Arc::clone(&onion_message_handler),
-		Arc::clone(&onion_message_handler),
+		Arc::clone(&channel_manager),
+		IgnoringMessageHandler {},
 	));
 	let mut ephemeral_bytes = [0; 32];
 	let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
@@ -1113,7 +1093,6 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		channel_manager,
 		gossip_sync,
 		onion_messenger,
-		onion_message_handler,
 		peer_manager,
 		bp_exit,
 		background_processor,
