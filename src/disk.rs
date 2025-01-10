@@ -34,6 +34,10 @@ impl Logger for FilesystemLogger {
 			return;
 		}
 
+		if record.level == Level::Gossip {
+			// Gossip-level logs are incredibly verbose, and thus we skip them by default.
+			return;
+		}
 		let raw_log = record.args.to_string();
 		let log = format!(
 			"{} {:<5} [{}:{}] {}\n",
