@@ -29,9 +29,8 @@ use lightning::ln::channelmanager::{
 };
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
-// use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
 use lightning::ln::types::ChannelId;
-use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
+// use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::log_info;
 use lightning::onion_message::messenger::{DefaultMessageRouter, SimpleArcOnionMessenger};
 use lightning::routing::gossip;
@@ -39,8 +38,10 @@ use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::sign::{EntropySource, InMemorySigner, KeysManager};
-// use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::types::payment::{PaymentHash, PaymentPreimage};
 use lightning::util::config::UserConfig;
+use lightning::util::hash_tables::hash_map::Entry;
+use lightning::util::hash_tables::HashMap;
 use lightning::util::logger::Logger;
 use lightning::util::persist::{
 	KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
@@ -54,11 +55,11 @@ use lightning_block_sync::init;
 use lightning_block_sync::poll;
 use lightning_block_sync::SpvClient;
 use lightning_block_sync::UnboundedCache;
+use lightning_invoice::PaymentSecret;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::{thread_rng, Rng};
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
 use std::fmt;
 use std::fs;
@@ -163,7 +164,7 @@ pub(crate) type GossipVerifier = lightning_block_sync::gossip::GossipVerifier<
 
 pub(crate) type P2PGossipSyncType = lightning::routing::gossip::P2PGossipSync<
 	Arc<NetworkGraph>,
-	GossipVerifier,
+	Arc<GossipVerifier>,
 	Arc<FilesystemLogger>,
 >;
 
@@ -234,7 +235,7 @@ async fn handle_ldk_events(
 			)
 			.expect("Lightning funding tx should always be to a SegWit output")
 			.to_address();
-			let mut outputs = vec![HashMap::with_capacity(1)];
+			let mut outputs = vec![StdHashMap::new()];
 			outputs[0].insert(addr, channel_value_satoshis as f64 / 100_000_000.0);
 			let raw_tx = bitcoind_client.create_raw_transaction(outputs).await;
 
@@ -261,17 +262,7 @@ async fn handle_ldk_events(
 		Event::FundingTxBroadcastSafe { .. } => {
 			// We don't use the manual broadcasting feature, so this event should never be seen.
 		},
-		Event::PaymentClaimable {
-			payment_hash,
-			purpose,
-			amount_msat,
-			receiver_node_id: _,
-			via_channel_id: _,
-			via_user_channel_id: _,
-			claim_deadline: _,
-			onion_fields: _,
-			counterparty_skimmed_fee_msat: _,
-		} => {
+		Event::PaymentClaimable { payment_hash, purpose, amount_msat, .. } => {
 			println!(
 				"\nEVENT: received payment from payment hash {} of {} millisatoshis",
 				payment_hash, amount_msat,
@@ -309,7 +300,7 @@ async fn handle_ldk_events(
 			let mut inbound = inbound_payments.lock().unwrap();
 			match inbound.payments.entry(payment_hash) {
 				Entry::Occupied(mut e) => {
-					let payment = e.get_mut();
+					let payment: &mut PaymentInfo = e.get_mut();
 					payment.status = HTLCStatus::Succeeded;
 					payment.preimage = payment_preimage;
 					payment.secret = payment_secret;
@@ -418,9 +409,7 @@ async fn handle_ldk_events(
 			total_fee_earned_msat,
 			claim_from_onchain_tx,
 			outbound_amount_forwarded_msat,
-			skimmed_fee_msat: _,
-			prev_user_channel_id: _,
-			next_user_channel_id: _,
+			..
 		} => {
 			let read_only_network_graph = network_graph.read_only();
 			let nodes = read_only_network_graph.nodes();
@@ -513,14 +502,7 @@ async fn handle_ldk_events(
 			print!("> ");
 			std::io::stdout().flush().unwrap();
 		},
-		Event::ChannelClosed {
-			channel_id,
-			reason,
-			user_channel_id: _,
-			counterparty_node_id,
-			channel_capacity_sats: _,
-			channel_funding_txo: _,
-		} => {
+		Event::ChannelClosed { channel_id, reason, counterparty_node_id, .. } => {
 			println!(
 				"\nEVENT: Channel {} with counterparty {} closed due to: {:?}",
 				channel_id,
@@ -700,7 +682,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&logger),
 	)));
 
-	// Step 10: Create Router
+	// Step 10: Create Routers
 	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
 	let router = Arc::new(DefaultRouter::new(
 		network_graph.clone(),
@@ -709,6 +691,9 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		scorer.clone(),
 		scoring_fee_params,
 	));
+
+	let message_router =
+		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
 
 	// Step 11: Initialize the ChannelManager
 	let mut user_config = UserConfig::default();
@@ -719,9 +704,9 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	let mut restarting_node = true;
 	let (channel_manager_blockhash, channel_manager) = {
 		if let Ok(f) = fs::File::open(format!("{}/manager", ldk_data_dir.clone())) {
-			let mut channel_monitor_mut_references = Vec::new();
-			for (_, channel_monitor) in channelmonitors.iter_mut() {
-				channel_monitor_mut_references.push(channel_monitor);
+			let mut channel_monitor_references = Vec::new();
+			for (_, channel_monitor) in channelmonitors.iter() {
+				channel_monitor_references.push(channel_monitor);
 			}
 			let read_args = ChannelManagerReadArgs::new(
 				keys_manager.clone(),
@@ -731,9 +716,10 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 				chain_monitor.clone(),
 				broadcaster.clone(),
 				router.clone(),
+				Arc::clone(&message_router),
 				logger.clone(),
 				user_config,
-				channel_monitor_mut_references,
+				channel_monitor_references,
 			);
 			<(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args).unwrap()
 		} else {
@@ -749,6 +735,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 				chain_monitor.clone(),
 				broadcaster.clone(),
 				router.clone(),
+				Arc::clone(&message_router),
 				logger.clone(),
 				keys_manager.clone(),
 				keys_manager.clone(),
@@ -855,7 +842,8 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
 		Arc::clone(&channel_manager),
-		Arc::new(DefaultMessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager))),
+		Arc::clone(&message_router),
+		Arc::clone(&channel_manager),
 		Arc::clone(&channel_manager),
 		Arc::clone(&channel_manager),
 		IgnoringMessageHandler {},
@@ -877,14 +865,14 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&keys_manager),
 	));
 
-	// Install a GossipVerifier in in the P2PGossipSync
+	// Install a GossipVerifier in the P2PGossipSync
 	let utxo_lookup = GossipVerifier::new(
 		Arc::clone(&bitcoind_client.bitcoind_rpc_client),
 		lightning_block_sync::gossip::TokioSpawner,
 		Arc::clone(&gossip_sync),
 		Arc::clone(&peer_manager),
 	);
-	gossip_sync.add_utxo_lookup(Some(utxo_lookup));
+	gossip_sync.add_utxo_lookup(Some(Arc::new(utxo_lookup)));
 
 	// ## Running LDK
 	// Step 17: Initialize networking
