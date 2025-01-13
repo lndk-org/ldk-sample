@@ -209,6 +209,7 @@ checksum = "48f9e1163868b86c37d43c586af9d917e699c87f1266ebfdf356ad1003458118"
 dependencies = [
  "bitcoin_hashes",
  "hex_lit",
+ "tokio",
 ]
 
 [[package]]
@@ -336,6 +337,7 @@ dependencies = [
  "lightning",
  "lightning-background-processor",
  "lightning-block-sync",
+ "lightning-dns-resolver",
  "lightning-invoice",
  "lightning-net-tokio",
  "lightning-persister",
@@ -398,6 +400,18 @@ dependencies = [
  "chunked_transfer",
  "lightning",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "lightning-dns-resolver"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c74e3e12284b661620e832b27adf8aa2d55027052a8cd5f0392a990fbd75bb9c"
+dependencies = [
+ "dnssec-prover",
+ "lightning",
+ "lightning-types",
  "tokio",
 ]
 

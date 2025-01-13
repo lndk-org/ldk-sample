@@ -30,9 +30,10 @@ use lightning::ln::channelmanager::{
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
 use lightning::ln::types::ChannelId;
-// use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::log_info;
-use lightning::onion_message::messenger::{DefaultMessageRouter, SimpleArcOnionMessenger};
+use lightning::onion_message::messenger::{
+	DefaultMessageRouter, OnionMessenger as LdkOnionMessenger,
+};
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::router::DefaultRouter;
@@ -55,6 +56,7 @@ use lightning_block_sync::init;
 use lightning_block_sync::poll;
 use lightning_block_sync::SpvClient;
 use lightning_block_sync::UnboundedCache;
+use lightning_dns_resolver::OMDomainResolver;
 use lightning_invoice::PaymentSecret;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
@@ -183,8 +185,19 @@ pub(crate) type ChannelManager =
 
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
 
-type OnionMessenger =
-	SimpleArcOnionMessenger<ChainMonitor, BitcoindClient, BitcoindClient, FilesystemLogger>;
+// Note that if you do not use an `OMDomainResolver` here you should use SimpleArcOnionMessenger
+// instead.
+type OnionMessenger = LdkOnionMessenger<
+	Arc<KeysManager>,
+	Arc<KeysManager>,
+	Arc<FilesystemLogger>,
+	Arc<ChannelManager>,
+	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<KeysManager>>>,
+	Arc<ChannelManager>,
+	Arc<ChannelManager>,
+	Arc<OMDomainResolver<Arc<ChannelManager>>>,
+	IgnoringMessageHandler,
+>;
 
 pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
 	Arc<BitcoindClient>,
@@ -835,8 +848,17 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	let gossip_sync =
 		Arc::new(P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger)));
 
-	// Step 16: Initialize the PeerManager
+	// Step 16 an OMDomainResolver as a service to other nodes
+	// As a service to other LDK users, using an `OMDomainResolver` allows others to resolve BIP
+	// 353 Human Readable Names for others, providing them DNSSEC proofs over lightning onion
+	// messages. Doing this only makes sense for a always-online public routing node, and doesn't
+	// provide you any direct value, but its nice to offer the service for others.
 	let channel_manager: Arc<ChannelManager> = Arc::new(channel_manager);
+	let resolver = "8.8.8.8:53".to_socket_addrs().unwrap().next().unwrap();
+	let domain_resolver =
+		Arc::new(OMDomainResolver::new(resolver, Some(Arc::clone(&channel_manager))));
+
+	// Step 17: Initialize the PeerManager
 	let onion_messenger: Arc<OnionMessenger> = Arc::new(OnionMessenger::new(
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
@@ -845,7 +867,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		Arc::clone(&message_router),
 		Arc::clone(&channel_manager),
 		Arc::clone(&channel_manager),
-		Arc::clone(&channel_manager),
+		domain_resolver,
 		IgnoringMessageHandler {},
 	));
 	let mut ephemeral_bytes = [0; 32];
@@ -875,7 +897,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 	gossip_sync.add_utxo_lookup(Some(Arc::new(utxo_lookup)));
 
 	// ## Running LDK
-	// Step 17: Initialize networking
+	// Step 18: Initialize networking
 
 	let peer_manager_connection_handler = peer_manager.clone();
 	let listening_port = args.ldk_peer_listening_port;
@@ -901,7 +923,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	});
 
-	// Step 18: Connect and Disconnect Blocks
+	// Step 19: Connect and Disconnect Blocks
 	let output_sweeper: Arc<OutputSweeper> = Arc::new(output_sweeper);
 	let channel_manager_listener = channel_manager.clone();
 	let chain_monitor_listener = chain_monitor.clone();
@@ -950,7 +972,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		.write("", "", OUTBOUND_PAYMENTS_FNAME, &outbound_payments.lock().unwrap().encode())
 		.unwrap();
 
-	// Step 19: Handle LDK Events
+	// Step 20: Handle LDK Events
 	let channel_manager_event_listener = Arc::clone(&channel_manager);
 	let bitcoind_client_event_listener = Arc::clone(&bitcoind_client);
 	let network_graph_event_listener = Arc::clone(&network_graph);
@@ -992,10 +1014,10 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	};
 
-	// Step 20: Persist ChannelManager and NetworkGraph
+	// Step 21: Persist ChannelManager and NetworkGraph
 	let persister = Arc::new(FilesystemStore::new(ldk_data_dir.clone().into()));
 
-	// Step 21: Background Processing
+	// Step 22: Background Processing
 	let (bp_exit, bp_exit_check) = tokio::sync::watch::channel(());
 	let background_processor = tokio::spawn(process_events_async(
 		Arc::clone(&persister),
