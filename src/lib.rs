@@ -73,8 +73,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-#[derive(Copy, Clone)]
-pub(crate) enum HTLCStatus {
+#[derive(Copy, Clone, Debug)]
+pub enum HTLCStatus {
 	Pending,
 	Succeeded,
 	Failed,
@@ -86,7 +86,8 @@ impl_writeable_tlv_based_enum!(HTLCStatus,
 	(2, Failed) => {},
 );
 
-pub(crate) struct MillisatAmount(Option<u64>);
+#[derive(Clone, Debug)]
+pub struct MillisatAmount(Option<u64>);
 
 impl fmt::Display for MillisatAmount {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -110,11 +111,12 @@ impl Writeable for MillisatAmount {
 	}
 }
 
-pub(crate) struct PaymentInfo {
-	preimage: Option<PaymentPreimage>,
-	secret: Option<PaymentSecret>,
-	status: HTLCStatus,
-	amt_msat: MillisatAmount,
+#[derive(Clone)]
+pub struct PaymentInfo {
+	pub preimage: Option<PaymentPreimage>,
+	pub secret: Option<PaymentSecret>,
+	pub status: HTLCStatus,
+	pub amt_msat: MillisatAmount,
 }
 
 impl_writeable_tlv_based!(PaymentInfo, {

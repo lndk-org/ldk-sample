@@ -215,6 +215,10 @@ impl Node {
 		pay
 	}
 
+	pub async fn list_payments(&self) -> Vec<PaymentInfo> {
+		self.outbound_payments.lock().unwrap().payments.values().cloned().collect()
+	}
+
 	pub async fn stop(self) {
 		// Disconnect our peers and stop accepting new connections. This ensures we don't continue
 		// updating our channel data after we've stopped the background processor.
