@@ -1126,6 +1126,7 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		bp_exit,
 		background_processor,
 		stop_listen_connect,
+		outbound_payments,
 		listening_port: args.ldk_peer_listening_port.clone(),
 		ldk_data_dir: ldk_data_dir_binding,
 	};
