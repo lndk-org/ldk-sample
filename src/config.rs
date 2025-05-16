@@ -1,4 +1,4 @@
-use bitcoin::network::constants::Network;
+use bitcoin::network::Network;
 use lightning::ln::msgs::SocketAddress;
 use lightning::util::logger::Level;
 use std::fs;

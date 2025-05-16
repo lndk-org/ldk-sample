@@ -1,27 +1,35 @@
 use crate::disk::{persist_channel_peer, FilesystemLogger};
-use crate::onion::{OnionMessageHandler, UserOnionMessageContents};
+use crate::onion::UserOnionMessageContents;
 use crate::{
-	BitcoindClient, ChainMonitor, ChannelManager, NetworkGraph, OnionMessengerType,
-	P2PGossipSyncType, PeerManagerType,
+	BitcoindClient, ChainMonitor, ChannelManager, HTLCStatus, MillisatAmount, NetworkGraph,
+	OnionMessenger, OutboundPaymentInfoStorage, P2PGossipSyncType, PaymentInfo, PeerManagerType,
+	OUTBOUND_PAYMENTS_FNAME,
 };
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::Network;
-use lightning::blinded_path::BlindedPath;
-use lightning::ln::ChannelId;
-use lightning::offers::offer::{Offer, OfferBuilder, Quantity};
+use lightning::blinded_path::message::{
+	BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext,
+};
+use lightning::ln::channelmanager::{PaymentId, Retry};
+use lightning::ln::types::ChannelId;
+use lightning::offers::nonce::Nonce;
+use lightning::offers::offer;
+use lightning::offers::offer::{Offer, Quantity};
 use lightning::offers::parse::Bolt12SemanticError;
-use lightning::onion_message::messenger::Destination;
+use lightning::onion_message::messenger::{Destination, MessageSendInstructions};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
-use lightning::sign::KeysManager;
+use lightning::sign::{EntropySource, KeysManager};
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig};
 use lightning::util::errors::APIError;
+use lightning::util::persist::KVStore;
+use lightning::util::ser::Writeable;
 use lightning_persister::fs_store::FilesystemStore;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use tokio::sync::watch::Sender;
@@ -47,12 +55,12 @@ pub struct Node {
 	pub(crate) scorer: Arc<RwLock<Scorer>>,
 	pub(crate) channel_manager: Arc<ChannelManager>,
 	pub(crate) gossip_sync: Arc<P2PGossipSyncType>,
-	pub(crate) onion_messenger: Arc<OnionMessengerType>,
-	pub onion_message_handler: Arc<OnionMessageHandler>,
+	pub(crate) onion_messenger: Arc<OnionMessenger>,
 	pub(crate) peer_manager: Arc<PeerManagerType>,
 	pub(crate) bp_exit: Sender<()>,
-	pub(crate) background_processor: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+	pub(crate) background_processor: tokio::task::JoinHandle<Result<(), lightning::io::Error>>,
 	pub(crate) stop_listen_connect: Arc<AtomicBool>,
+	pub(crate) outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>,
 
 	// Config values
 	pub(crate) listening_port: u16,
@@ -110,11 +118,11 @@ impl Node {
 			return Err(());
 		}
 		let destination = Destination::Node(intermediate_nodes.pop().unwrap());
-		match self.onion_messenger.send_onion_message(
-			UserOnionMessageContents { tlv_type, data },
-			destination,
-			None,
-		) {
+		let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+		match self
+			.onion_messenger
+			.send_onion_message(UserOnionMessageContents { tlv_type, data }, instructions)
+		{
 			Ok(success) => {
 				println!("SUCCESS: forwarded onion message to first hop {:?}", success);
 				Ok(())
@@ -129,15 +137,30 @@ impl Node {
 	// Build an offer for receiving payments at this node. path_pubkeys lists the nodes the path will contain,
 	// starting with the introduction node and ending in the destination node (the current node).
 	pub async fn create_offer(
-		&self, path_pubkeys: &[PublicKey], network: Network, msats: u64, quantity: Quantity,
+		&self, intermediate_nodes: &[PublicKey], network: Network, msats: u64, quantity: Quantity,
 		expiration: SystemTime,
 	) -> Result<Offer, Bolt12SemanticError> {
 		let secp_ctx = Secp256k1::new();
-		let path =
-			BlindedPath::new_for_message(path_pubkeys, &*self.keys_manager, &secp_ctx).unwrap();
-		let (pubkey, _) = self.get_node_info();
+		let payee_node_id = intermediate_nodes[0];
+		let intermediate_nodes = intermediate_nodes
+			.iter()
+			.map(|node| MessageForwardNode { node_id: *node, short_channel_id: None })
+			.collect::<Vec<_>>();
+		let context = MessageContext::Offers(OffersContext::InvoiceRequest {
+			nonce: Nonce::from_entropy_source(&*self.keys_manager),
+		});
+		let path = BlindedMessagePath::new(
+			&intermediate_nodes,
+			payee_node_id,
+			context,
+			&*self.keys_manager,
+			&secp_ctx,
+		)
+		.unwrap();
 
-		OfferBuilder::new(pubkey)
+		self.channel_manager
+			.create_offer_builder(None)
+			.unwrap()
 			.description("testing offer".to_string())
 			.amount_msats(msats)
 			.chain(network)
@@ -146,6 +169,54 @@ impl Node {
 			.issuer("Foo Bar".to_string())
 			.path(path)
 			.build()
+	}
+
+	pub async fn pay_offer(
+		&self, offer: Offer, amount: Option<u64>,
+	) -> Result<(), Bolt12SemanticError> {
+		let random_bytes = self.keys_manager.get_secure_random_bytes();
+		let payment_id = PaymentId(random_bytes);
+
+		let amt_msat = match (offer.amount(), amount) {
+			(Some(offer::Amount::Bitcoin { amount_msats }), _) => amount_msats,
+			(_, Some(amt)) => amt,
+			(amt, _) => {
+				println!("ERROR: Cannot process non-Bitcoin-denominated offer value {:?}", amt);
+				return Err(Bolt12SemanticError::InvalidAmount);
+			},
+		};
+		if amount.is_some() && amount != Some(amt_msat) {
+			println!("Amount didn't match offer of {}msat", amt_msat);
+			return Err(Bolt12SemanticError::InvalidAmount);
+		}
+
+		self.outbound_payments.lock().unwrap().payments.insert(
+			payment_id,
+			PaymentInfo {
+				preimage: None,
+				secret: None,
+				status: HTLCStatus::Pending,
+				amt_msat: MillisatAmount(Some(amt_msat)),
+			},
+		);
+		self.persister
+			.write("", "", OUTBOUND_PAYMENTS_FNAME, &self.outbound_payments.encode())
+			.unwrap();
+
+		let retry = Retry::Timeout(Duration::from_secs(10));
+		let amt = Some(amt_msat);
+		let pay =
+			self.channel_manager.pay_for_offer(&offer, None, amt, None, payment_id, retry, None);
+		if pay.is_ok() {
+			println!("Payment in flight");
+		} else {
+			println!("ERROR: Failed to pay: {:?}", pay);
+		}
+		pay
+	}
+
+	pub async fn list_payments(&self) -> Vec<PaymentInfo> {
+		self.outbound_payments.lock().unwrap().payments.values().cloned().collect()
 	}
 
 	pub async fn stop(self) {
@@ -205,7 +276,7 @@ fn open_channel(
 	let config = UserConfig {
 		channel_handshake_limits: ChannelHandshakeLimits { ..Default::default() },
 		channel_handshake_config: ChannelHandshakeConfig {
-			announced_channel,
+			announce_for_forwarding: announced_channel,
 			negotiate_anchors_zero_fee_htlc_tx: with_anchors,
 			..Default::default()
 		},
