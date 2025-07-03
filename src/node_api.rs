@@ -231,6 +231,20 @@ impl Node {
 			self.background_processor.await.unwrap().unwrap();
 		}
 	}
+
+	pub async fn close_channel(
+		&self, channel_id: ChannelId, peer_pubkey: PublicKey,
+	) -> Result<(), ()> {
+		self.channel_manager.close_channel(&channel_id, &peer_pubkey).map_err(|_| ())
+	}
+
+	pub async fn list_channels(&self) -> Vec<(ChannelId, PublicKey)> {
+		self.channel_manager
+			.list_channels()
+			.iter()
+			.map(|c| (c.channel_id, c.counterparty.node_id))
+			.collect::<Vec<_>>()
+	}
 }
 
 pub(crate) async fn connect_peer_if_necessary(
