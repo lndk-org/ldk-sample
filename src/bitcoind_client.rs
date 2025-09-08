@@ -4,7 +4,7 @@ use crate::convert::{
 };
 use crate::disk::FilesystemLogger;
 use crate::hex_utils;
-use base64;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bitcoin::address::Address;
 use bitcoin::blockdata::constants::WITNESS_SCALE_FACTOR;
 use bitcoin::blockdata::script::ScriptBuf;
@@ -74,7 +74,7 @@ impl BitcoindClient {
 	) -> std::io::Result<Self> {
 		let http_endpoint = HttpEndpoint::for_host(host.clone()).with_port(port);
 		let rpc_credentials =
-			base64::encode(format!("{}:{}", rpc_user.clone(), rpc_password.clone()));
+			BASE64.encode(format!("{}:{}", rpc_user.clone(), rpc_password.clone()));
 		let bitcoind_rpc_client = RpcClient::new(&rpc_credentials, http_endpoint);
 		let _dummy = bitcoind_rpc_client
 			.call_method::<BlockchainInfo>("getblockchaininfo", &vec![])
@@ -275,7 +275,7 @@ impl BitcoindClient {
 
 	pub fn get_new_rpc_client(&self) -> RpcClient {
 		let http_endpoint = HttpEndpoint::for_host(self.host.clone()).with_port(self.port);
-		let rpc_credentials = base64::encode(format!("{}:{}", self.rpc_user, self.rpc_password));
+		let rpc_credentials = BASE64.encode(format!("{}:{}", self.rpc_user, self.rpc_password));
 		RpcClient::new(&rpc_credentials, http_endpoint)
 	}
 
