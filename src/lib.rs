@@ -1059,13 +1059,10 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		}
 	};
 
-	// Step 21: Persist ChannelManager and NetworkGraph
-	let persister = Arc::new(FilesystemStore::new(ldk_data_dir.clone().into()));
-
-	// Step 22: Background Processing
+	// Step 21: Background Processing
 	let (bp_exit, bp_exit_check) = tokio::sync::watch::channel(());
 	let background_processor = tokio::spawn(process_events_async(
-		Arc::clone(&persister),
+		Arc::clone(&fs_store),
 		event_handler,
 		Arc::clone(&chain_monitor),
 		Arc::clone(&channel_manager),
@@ -1164,14 +1161,14 @@ pub async fn start_ldk(args: config::LdkUserInfo, test_name: &str) -> node_api::
 		ldk_data_dir.clone(),
 		Arc::clone(&keys_manager),
 		Arc::clone(&logger),
-		Arc::clone(&persister),
+		Arc::clone(&fs_store),
 		Arc::clone(&output_sweeper),
 	));
 
 	return node_api::Node {
 		logger,
 		bitcoind_client,
-		persister,
+		persister: fs_store,
 		chain_monitor,
 		keys_manager,
 		network_graph,
