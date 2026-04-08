@@ -1,4 +1,4 @@
-use crate::disk::{persist_channel_peer, FilesystemLogger};
+use crate::disk::FilesystemLogger;
 use crate::onion::UserOnionMessageContents;
 use crate::{
 	BitcoindClient, ChainMonitor, ChannelManager, HTLCStatus, MillisatAmount, NetworkGraph,
@@ -27,7 +27,6 @@ use lightning::util::persist::KVStoreSync;
 use lightning::util::ser::Writeable;
 use lightning_persister::fs_store::FilesystemStore;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
@@ -88,7 +87,6 @@ impl Node {
 			return Err(APIError::ChannelUnavailable { err: "Cannot connect to peer".to_string() });
 		};
 
-		let peer_pubkey_and_ip_addr = peer_pubkey.to_string() + "@" + &peer_addr.to_string();
 		match open_channel(
 			peer_pubkey,
 			chan_amt_sat,
@@ -97,11 +95,7 @@ impl Node {
 			false, // Without anchors for simplicity.
 			self.channel_manager.clone(),
 		) {
-			Ok(channel_id) => {
-				let peer_data_path = format!("{:?}/channel_peer_data", self.ldk_data_dir);
-				let _ = persist_channel_peer(Path::new(&peer_data_path), &peer_pubkey_and_ip_addr);
-				Ok(channel_id)
-			},
+			Ok(channel_id) => Ok(channel_id),
 			Err(e) => Err(e),
 		}
 	}
