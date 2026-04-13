@@ -1,4 +1,4 @@
-use crate::disk::{persist_channel_peer, FilesystemLogger};
+use crate::disk::FilesystemLogger;
 use crate::onion::UserOnionMessageContents;
 use crate::{
 	BitcoindClient, ChainMonitor, ChannelManager, HTLCStatus, MillisatAmount, NetworkGraph,
@@ -11,7 +11,7 @@ use bitcoin::Network;
 use lightning::blinded_path::message::{
 	BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext,
 };
-use lightning::ln::channelmanager::{PaymentId, Retry};
+use lightning::ln::channelmanager::{OptionalOfferPaymentParams, PaymentId, Retry};
 use lightning::ln::types::ChannelId;
 use lightning::offers::nonce::Nonce;
 use lightning::offers::offer;
@@ -20,14 +20,13 @@ use lightning::offers::parse::Bolt12SemanticError;
 use lightning::onion_message::messenger::{Destination, MessageSendInstructions};
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
-use lightning::sign::{EntropySource, KeysManager};
+use lightning::sign::{EntropySource, KeysManager, NodeSigner};
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig};
 use lightning::util::errors::APIError;
-use lightning::util::persist::KVStore;
+use lightning::util::persist::KVStoreSync;
 use lightning::util::ser::Writeable;
 use lightning_persister::fs_store::FilesystemStore;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
@@ -88,7 +87,6 @@ impl Node {
 			return Err(APIError::ChannelUnavailable { err: "Cannot connect to peer".to_string() });
 		};
 
-		let peer_pubkey_and_ip_addr = peer_pubkey.to_string() + "@" + &peer_addr.to_string();
 		match open_channel(
 			peer_pubkey,
 			chan_amt_sat,
@@ -97,11 +95,7 @@ impl Node {
 			false, // Without anchors for simplicity.
 			self.channel_manager.clone(),
 		) {
-			Ok(channel_id) => {
-				let peer_data_path = format!("{:?}/channel_peer_data", self.ldk_data_dir);
-				let _ = persist_channel_peer(Path::new(&peer_data_path), &peer_pubkey_and_ip_addr);
-				Ok(channel_id)
-			},
+			Ok(channel_id) => Ok(channel_id),
 			Err(e) => Err(e),
 		}
 	}
@@ -149,17 +143,18 @@ impl Node {
 		let context = MessageContext::Offers(OffersContext::InvoiceRequest {
 			nonce: Nonce::from_entropy_source(&*self.keys_manager),
 		});
+		let receive_auth_key = self.keys_manager.get_receive_auth_key();
 		let path = BlindedMessagePath::new(
 			&intermediate_nodes,
 			payee_node_id,
+			receive_auth_key,
 			context,
 			&*self.keys_manager,
 			&secp_ctx,
-		)
-		.unwrap();
+		);
 
 		self.channel_manager
-			.create_offer_builder(None)
+			.create_offer_builder()
 			.unwrap()
 			.description("testing offer".to_string())
 			.amount_msats(msats)
@@ -200,13 +195,15 @@ impl Node {
 			},
 		);
 		self.persister
-			.write("", "", OUTBOUND_PAYMENTS_FNAME, &self.outbound_payments.encode())
+			.write("", "", OUTBOUND_PAYMENTS_FNAME, self.outbound_payments.encode())
 			.unwrap();
 
-		let retry = Retry::Timeout(Duration::from_secs(10));
+		let params = OptionalOfferPaymentParams {
+			retry_strategy: Retry::Timeout(Duration::from_secs(10)),
+			..Default::default()
+		};
 		let amt = Some(amt_msat);
-		let pay =
-			self.channel_manager.pay_for_offer(&offer, None, amt, None, payment_id, retry, None);
+		let pay = self.channel_manager.pay_for_offer(&offer, amt, payment_id, params);
 		if pay.is_ok() {
 			println!("Payment in flight");
 		} else {
